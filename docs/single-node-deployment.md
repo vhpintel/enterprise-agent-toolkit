@@ -1,0 +1,428 @@
+
+## Table of Contents
+
+- [Step 1 — Base Stack](#step-1--base-stack)
+- [Verify the Base Stack](#verify-the-base-stack)
+- [Step 1b — Semantic Router](#step-1b--semantic-router-intelligent-query-routing)
+- [Step 2 — Redis (Shared Memory Backend)](#step-2--redis-shared-memory-backend)
+- [Step 2b — PostgreSQL + pgvector (Vector Store)](#step-2b--postgresql--pgvector-vector-store--long-term-memory)
+
+---
+
+## Step 1 — Base Stack
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/intel/enterprise-agent-toolkit.git
+cd enterprise-agent-toolkit
+```
+
+### 2. Edit `core/inventory/agentic-config.cfg`
+
+Open `core/inventory/agentic-config.cfg` and fill in your values:
+
+```ini
+# Your cluster FQDN — this becomes the base URL for all services
+cluster_url=api.example.com     # change to your domain e.g. intel.edge.com
+
+# TLS certificate — provide a full-chain cert + private key
+# For a custom domain: supply your CA-signed or self-signed cert/key files
+cert_file=/path/to/your/fullchain.pem
+key_file=/path/to/your/private.key
+
+# HuggingFace token (required to pull gated models)
+hugging_face_token=hf_xxxxxxxxxxxxxxxxxxxx
+
+# Model to deploy — select the model from the model list (ex :cpu-qwen3-coder-30b)
+models=cpu-qwen3-coder-30b
+cpu_or_gpu=cpu
+
+# Enable/disable stack components
+deploy_kubernetes_fresh=on
+deploy_ingress_controller=on
+deploy_genai_gateway=on
+deploy_observability=on
+deploy_llm_models=on
+deploy_redis=on          # standalone Redis Stack in its own namespace
+deploy_pgvector=off      # optional: PostgreSQL 16 + pgvector — shared vector store and long-term memory backend
+```
+
+### 3. Choose your model
+
+Set the `models` field in `agentic-config.cfg` to one value from the table below:
+
+**CPU models** (`cpu_or_gpu=cpu`)
+
+| # | Value to set in `models` | Model |
+|---|---|---|
+| `21` | `cpu-llama-8b` | meta-llama/Llama-3.1-8B-Instruct |
+| `22` | `cpu-qwen3-coder-30b` | Qwen/Qwen3-Coder-30B-A3B-Instruct |
+| `23` | `cpu-qwen2-5-coder-14b` | Qwen/Qwen2.5-Coder-14B-Instruct |
+| `24` | `cpu-whisper-small` | openai/whisper-small |
+| `25` | `cpu-tei` | BAAI/bge-base-en-v1.5 *(text embedding)* |
+| `26` | `cpu-rerank` | BAAI/bge-reranker-base *(reranking)* |
+
+Multiple models can be deployed together using a comma-separated list: `models=cpu-qwen3-coder-30b,cpu-llama-8b`
+
+### 4. Run the deployment
+
+```bash
+chmod +x deploy-agentic-stack.sh
+./deploy-agentic-stack.sh
+```
+
+**What the script does automatically:**
+
+| Step | Action |
+|---|---|
+| 1 | Detect OS, architecture, and package manager |
+| 2 | Install system prerequisites (`git`, `curl`, `python3`, etc.) |
+| 3 | Configure passwordless SSH to localhost |
+| 4 | Generate or reuse TLS certificate for `cluster_url` |
+| 5 | Add `cluster_url` → `127.0.0.1` to `/etc/hosts` (if not DNS-resolvable) |
+| 6 | Install Kubernetes via Kubespray (~15 min) |
+| 7 | Deploy NGINX Ingress Controller |
+| 8 | Deploy LiteLLM + Redis + Langfuse (GenAI Gateway) |
+| 9 | Deploy Prometheus + Grafana + Loki (Observability) |
+| 10 | Deploy selected model(s) via vLLM CPU or GPU |
+
+**Estimated time:** 20–40 minutes on a fresh node.
+
+All output is also written to `deploy.log` in the repo root.
+
+---
+
+## Verify the Base Stack
+
+After Step 1 completes, verify all pods are healthy before proceeding to Step 2:
+
+```bash
+# All pods should be Running
+# (the vLLM pod may take an additional 10-15 min to pull the model weights)
+kubectl get pods -A
+
+# Retrieve the LiteLLM master key
+export LITELLM_MASTER_KEY=$(kubectl get deploy -n genai-gateway genai-gateway-deployment \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="LITELLM_MASTER_KEY")].value}')
+
+# Confirm the model API is responding (replace api.example.com with your cluster_url):
+# First, list registered models to confirm the model name:
+curl -k https://api.example.com/v1/models \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}"
+
+# Then test chat completions (use the model name returned by /v1/models above):
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{"model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+       "messages": [{"role":"user","content":"Write a Python hello world"}],
+       "max_tokens": 100}'
+```
+
+> The `LITELLM_MASTER_KEY` is set in the `genai-gateway-deployment` environment variables in the `genai-gateway` namespace.
+
+---
+
+## Step 1b — Semantic Router (Intelligent Query Routing)
+
+Semantic routing automatically directs queries to the most appropriate model based on content analysis using embeddings. This allows you to route simple queries to faster/cheaper CPU models while directing complex tasks to more powerful GPU models or larger CPU models.
+
+**Why Use Semantic Routing?**
+
+- **Cost optimization:** Route simple queries to efficient models, complex ones to powerful models
+- **Latency reduction:** Fast models handle straightforward requests quickly
+- **Intelligent dispatch:** Coding tasks → coding-specialized models, reasoning → larger models
+- **Transparent routing:** Applications use a single model name (e.g., `smart_router`), routing happens server-side
+
+> **📚 For more information:** See the official [LiteLLM Auto Routing documentation](https://docs.litellm.ai/docs/proxy/auto_routing#litellm-proxy-server)
+
+### Prerequisites
+
+- Step 1 complete and base stack verified
+- At least one model deployed (you'll add a second model for routing)
+
+### 1. Deploy a Second Model
+
+To enable semantic routing, deploy a more powerful model alongside your existing one.
+- A **larger CPU model** for better capabilities without requiring GPU hardware
+
+
+**Deploy a Larger CPU Model:**
+
+Update `core/inventory/agentic-config.cfg`:
+
+```ini
+# Add a larger CPU model (option 24 is DeepSeek-R1-Distill-Qwen-32B or option 27 is Qwen3-Coder-30B)
+models=cpu-qwen3-coder-30b,cpu-deepseek-r1-distill-qwen-32b
+cpu_or_gpu=cpu
+```
+
+**Deploy the model:**
+
+```bash
+# Update agentic-config.cfg with the new model, then re-run the deploy script.
+# It resumes automatically — already-running components are skipped.
+./deploy-agentic-stack.sh
+```
+
+
+### 2. Deploy Embedding Model for Semantic Matching
+
+Semantic routing requires an embedding model to generate vector representations of user queries and match them against predefined utterances. Deploy a Text Embedding Inference (TEI) service with **BAAI/bge-base-en-v1.5** using the deploy script.
+
+**Update `core/inventory/agentic-config.cfg` to include the embedding model:**
+
+```ini
+# Add embedding model to your existing models
+models=cpu-tei
+```
+
+**Deploy the embedding model:**
+
+```bash
+# Update agentic-config.cfg to add the embedding model, then re-run:
+./deploy-agentic-stack.sh
+```
+
+### 3. Access the LiteLLM UI
+
+Navigate to the LiteLLM UI in your browser:
+
+```
+https://api.example.com
+```
+
+Replace `api.example.com` with your actual `cluster_url` from the configuration.
+
+Login credentials:
+- The UI uses the same authentication as the API
+- You'll need your `LITELLM_MASTER_KEY` for API access
+
+### 4. Configure Semantic Router via UI
+
+**Step 4a - Verify the Embedding Model:**
+
+The embedding model is automatically registered in LiteLLM when deployed via `deploy-agentic-stack.sh`. Verify it's available:
+
+1. Navigate to: **Models+Endpoints** → **Models** tab
+2. Look for `BAAI/bge-base-en-v1.5` in the models list
+3. Note the model name - you'll use it in the next step (typically `BAAI/bge-base-en-v1.5`)
+
+**Step 4b - Configure the Auto Router:**
+
+Navigate to: **Models+Endpoints** → **Add Model** → **Auto Router** Tab
+
+**Configure the following required fields:**
+
+| Field | Value | Description |
+|-------|-------|-------------|
+| **Auto Router Name** | `smart_router` | The model name developers will use in API requests (you can choose any name) |
+| **Default Model** | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | Fallback model when no route matches (your smaller/faster model) |
+| **Embedding Model** | `BAAI/bge-base-en-v1.5` | The embedding model deployed in Step 2 (auto-registered) |
+
+**Configure Routes:**
+
+Click **Add Route** to create routing rules. Configure at least two routes:
+
+**Route 1 - Simple Queries (Smaller/Faster Model):**
+- **Target Model:** `Qwen/Qwen3-Coder-30B-A3B-Instruct`
+- **Utterances:**
+  ```
+  what is [topic]
+  define [term]
+  explain [concept] simply
+  hello
+  write a simple [language] function
+  ```
+- **Description:** Simple queries and basic coding tasks
+- **Score Threshold:** `0.5`
+
+**Route 2 - Complex Queries (More Powerful Model):**
+- **Target Model:** `Qwen/Qwen2.5-32B-Instruct` (GPU model) OR `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` (larger CPU model)
+- **Utterances:**
+  ```
+  design a [system] architecture
+  optimize this [language] code for performance
+  debug this complex [issue]
+  refactor this codebase to use [pattern]
+  implement a distributed [system]
+  create a production-ready [application]
+  how to code a program in [language]
+  can you explain this [language] code
+  can you convert this [language] code to [target_language]
+  ```
+- **Description:** Complex coding tasks and system design
+- **Score Threshold:** `0.5`
+
+Click **Save** to activate the semantic router.
+
+### 5. Verify Semantic Routing
+
+Test that queries are being routed correctly based on content:
+
+**Simple query (should route to smaller model - fast response):**
+
+```bash
+export LITELLM_MASTER_KEY=$(kubectl get deploy -n genai-gateway genai-gateway-deployment \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="LITELLM_MASTER_KEY")].value}')
+
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{
+    "model": "smart_router",
+    "messages": [{"role":"user","content":"What is a Python list?"}],
+    "max_tokens": 100
+  }'
+```
+
+**Complex query (should route to more powerful model):**
+
+```bash
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{
+    "model": "smart_router",
+    "messages": [{"role":"user","content":"How to code a program in Python that implements a distributed task queue with Redis backend"}],
+    "max_tokens": 200
+  }'
+```
+
+**Check routing decisions in Langfuse:**
+
+Navigate to the Langfuse dashboard to see which model handled each request:
+
+```
+https://trace-api.example.com
+```
+
+Look for the `model` field in the trace details to confirm routing decisions.
+
+### How It Works
+
+1. When a request comes in with `model="smart_router"` (or your chosen router name), LiteLLM generates embeddings for the input message
+2. It compares these embeddings against the utterances defined in your routes
+3. If a route's similarity score exceeds the threshold, the request is routed to that model
+4. If no route matches, the request goes to the default model
+
+### Routing Configuration Tips
+
+- **Adjust score_threshold:** Lower values (0.3-0.4) route more queries to that model, higher values (0.6-0.7) require closer matches
+- **Add more utterances:** Include domain-specific examples that represent your actual workload patterns
+- **Use placeholders:** `[variable]` in utterances creates flexible matching patterns (e.g., `[language]`, `[system]`)
+- **Monitor in Langfuse:** Track which queries route where and adjust thresholds based on actual usage
+- **Test thoroughly:** Send diverse queries to understand routing behavior before production use
+
+---
+
+## Step 2 — Redis (Shared Memory Backend)
+
+Redis is the **common memory backend** for all agentic workloads in this stack — deploy it before any use-case agent.
+The `core/helm-charts/redis` chart deploys **Redis Stack** (includes RediSearch) into its own `redis` namespace as a single persistent instance shared across all agents.
+
+**Automated deployment (recommended):**
+
+Set `deploy_redis=on` in `core/inventory/agentic-config.cfg` before running `./deploy-agentic-stack.sh`. Redis is deployed automatically as part of the stack, in the correct order.
+
+```ini
+deploy_redis=on
+```
+
+**Manual deployment (alternative / standalone):**
+
+```bash
+# 1. Resolve Helm chart dependencies (fetches the redis-stack-server subchart)
+helm dependency build core/helm-charts/redis
+
+# 2. Deploy into the `redis` namespace
+helm upgrade --install redis core/helm-charts/redis \
+  --namespace redis \
+  --create-namespace \
+  --wait --timeout 5m
+```
+
+**Verify it is running:**
+
+```bash
+kubectl get pods -n redis
+# NAME                       READY   STATUS    RESTARTS   AGE
+# redis-stack-server-0       1/1     Running   0          60s
+
+# Quick connectivity test
+kubectl exec -n redis redis-stack-server-0 -- redis-cli ping
+# PONG
+```
+
+**Redis URL (in-cluster) — use this in all agents:**
+
+```
+redis://redis-stack-server.redis.svc.cluster.local:6379
+```
+
+> This URL is the single source of truth for all agent workloads connecting to Redis within the cluster.
+
+---
+
+## Step 2b — PostgreSQL + pgvector (Vector Store & Long-Term Memory)
+
+PostgreSQL 16 with the **pgvector** extension gives every agentic workload a persistent, queryable vector store for long-term memory, RAG pipelines, semantic search, and structured state storage — all within the cluster.
+
+**When to enable:**
+- Your agent needs long-term memory that survives pod/session restarts
+- You are building RAG pipelines that store and retrieve embeddings
+- Use cases require structured relational + vector data in the same store
+- You want a production-grade alternative to in-memory vector stores
+
+**Enable in `core/inventory/agentic-config.cfg`:**
+
+```ini
+deploy_pgvector=on
+```
+
+Then run (or re-run) the deploy script — already-running components are skipped automatically:
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+**What gets deployed:**
+
+| Resource | Detail |
+|---|---|
+| Namespace | `pgvector` |
+| Image | `pgvector/pgvector:pg16` (PostgreSQL 16 + pgvector extension) |
+| Service | `pgvector.pgvector.svc.cluster.local:5432` |
+| Database | `agentdb` |
+| User | `agentuser` |
+| Credentials secret | `pgvector-credentials` in the `pgvector` namespace or available in `core/inventory/metadata/vault.yml` |
+
+**Verify it is running:**
+
+```bash
+kubectl get pods -n pgvector
+# NAME                    READY   STATUS    RESTARTS   AGE
+# pgvector-0              1/1     Running   0          60s
+
+# Confirm pgvector extension is active
+kubectl exec -n pgvector pgvector-0 -- \
+  psql -U agentuser -d agentdb \
+  -c "SELECT extname, extversion FROM pg_extension WHERE extname='vector';"
+# extname | extversion
+# --------+-----------
+# vector  | 0.8.0
+```
+
+**Retrieve the connection string from the cluster secret:**
+
+```bash
+kubectl get secret pgvector-credentials -n pgvector \
+  -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+# postgresql://agentuser:<password>@pgvector.pgvector.svc.cluster.local:5432/agentdb
+```
+
+**In-cluster connection string (for use in agent workloads):**
+
+```
+postgresql://agentuser:<password>@pgvector.pgvector.svc.cluster.local:5432/agentdb
+```

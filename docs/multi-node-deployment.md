@@ -1,8 +1,8 @@
 # Multi-Node Deployment Guide
 
-This guide describes how to deploy the Agentic AI Stack across multiple nodes — a control-plane node running all stack services plus one or more worker nodes that host additional LLM inference workloads.
+This guide describes how to deploy the Intel AI for Enterprise Agent Toolkit across multiple nodes — a control-plane node running all stack services plus one or more worker nodes that host additional LLM inference workloads.
 
-The Kubernetes layer is provisioned by **Kubespray**, which natively supports multi-node clusters. Everything above Kubernetes (LiteLLM, Langfuse, Redis, Coding Agent, Prometheus/Grafana) runs on the cluster and is automatically distributed by Kubernetes scheduling.
+The Kubernetes layer is provisioned by **Kubespray**, which natively supports multi-node clusters. Everything above Kubernetes (LiteLLM, Langfuse, Redis, Prometheus/Grafana) runs on the cluster and is automatically distributed by Kubernetes scheduling.
 
 ---
 
@@ -144,7 +144,6 @@ Add all stack subdomains pointing to the control-plane node (or load balancer IP
 sudo bash -c 'cat >> /etc/hosts <<EOF
 10.0.0.1 api.example.com
 10.0.0.1 trace-api.example.com
-10.0.0.1 coding-agent-api.example.com
 EOF'
 ```
 
@@ -156,7 +155,7 @@ DOMAIN="api.example.com"   # replace with your cluster_url
 mkdir -p ~/certs && cd ~/certs && \
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
   -subj "/CN=${DOMAIN}" \
-  -addext "subjectAltName = DNS:${DOMAIN}, DNS:trace-${DOMAIN}, DNS:coding-agent-${DOMAIN}"
+  -addext "subjectAltName = DNS:${DOMAIN}, DNS:trace-${DOMAIN}, DNS:*.${DOMAIN}"
 ```
 
 Set the generated paths in `core/inventory/agentic-config.cfg`:
@@ -180,16 +179,18 @@ key_file=/home/ubuntu/certs/key.pem
 
 hugging_face_token=hf_xxxxxxxxxxxxxxxxxxxx
 
-models=cpu-qwen2-5-coder-14b      # model to deploy (see supported models)
+models=cpu-qwen3-coder-30b      # model to deploy (see supported models)
 cpu_or_gpu=cpu
 
+# Enable/disable stack components
 deploy_kubernetes_fresh=on
 deploy_ingress_controller=on
 deploy_genai_gateway=on
 deploy_observability=on
 deploy_llm_models=on
-deploy_redis=on
-deploy_coding_agent=on
+deploy_redis=on          # standalone Redis Stack in its own namespace
+deploy_pgvector=off      # optional: PostgreSQL 16 + pgvector — shared vector store and long-term memory backend
+
 ```
 
 ---
