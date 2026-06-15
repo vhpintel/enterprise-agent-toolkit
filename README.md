@@ -24,7 +24,7 @@ Deploys a full Kubernetes-based stack with GenAI Gateway (LiteLLM + Langfuse), o
 
 The Intel® AI for Enterprise Agent Toolkit is a production-ready, Kubernetes-based platform that turns single or multi server into a fully operational AI agent infrastructure. It bundles every layer an enterprise needs to build, run, and govern AI agents — from secure API routing and intelligent model dispatch, to sandboxed code execution, persistent agent memory, and real-time observability.
 
-Built on Intel® Xeon® Scalable processors (and optionally Intel® AI Accelerators), the stack is optimized for CPU-efficient inference out of the box and is designed to grow: models on external GPU clusters can be added to the same gateway at any time.
+Built on Intel® Xeon® Scalable processors (and optionally Intel® AI Accelerators), the stack is optimized for CPU-efficient inference out of the box and is designed to grow: models endpoints deployed on GPU or cloud can be added to the same gateway at any time.
 
 ### Architecture Flow Diagram
 
@@ -38,10 +38,10 @@ Built on Intel® Xeon® Scalable processors (and optionally Intel® AI Accelerat
 Unified, secure API entry point with policy-driven routing, rate limiting, and enterprise-grade authentication and authorization for agents, tools, and applications. Powered by **LiteLLM** (OpenAI-compatible gateway) every request is authenticated and governed before it reaches a model or tool.
 
 ### Intelligent Routing
-Automatically routes inference workloads to CPUs or GPUs based on the intent of the request — reasoning and planning tasks stay on in-cluster CPU nodes, while heavy compute (encoders, large generation) can be forwarded to external GPU clusters. The routing layer is model-agnostic and supports any OpenAI-compatible backend.
+Automatically routes inference workloads to CPUs or GPUs based on the intent of the request — reasoning and planning tasks can be routed to GPU/cloud model endpoints while act/execute can be routed to CPU model endpoints. The routing layer is model-agnostic and supports any OpenAI-compatible backend. 
 
 ### Actions & Sandbox
-Enables safe agent actions through sandboxed code execution, tool isolation, token telemetry, and policy-driven governance to control blast radius and ensure enterprise compliance. The **Agent Sandbox** controller ([kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)) provides isolated, ephemeral Kubernetes pod environments — each sandbox is a fully self-contained pod with its own filesystem and process tree.
+Enables safe agent actions through sandboxed code execution, tool isolation, and policy-driven governance to control blast radius and ensure enterprise compliance. The **Agent Sandbox** controller ([kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)) provides isolated, ephemeral Kubernetes pod environments — each sandbox is a fully self-contained pod with its own filesystem and process tree.
 
 ### Memory, State & Context
 Provides scalable short- and long-term agent memory using vector databases and relational stores to maintain context across tasks, sessions, and workflows. **Redis** (with RediSearch) is deployed as the default memory backend, giving agents persistent session state, semantic search over past interactions, and cross-request continuity.
