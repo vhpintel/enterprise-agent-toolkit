@@ -4,25 +4,22 @@ This guide describes how to deploy the Intel AI for Enterprise Agent Toolkit acr
 
 The Kubernetes layer is provisioned by **Kubespray**, which natively supports multi-node clusters. Everything above Kubernetes (LiteLLM, Langfuse, Redis, Prometheus/Grafana) runs on the cluster and is automatically distributed by Kubernetes scheduling.
 
----
 
-## Prerequisites
+## Table of Contents
 
-- **Two or more Ubuntu 22.04 / 24.04 servers** on the same network with SSH reachability between them.
-- **Passwordless SSH** from the control-plane node to every worker node (see the [SSH Key Setup](../README.md#ssh-key-setup) section in the main README).
-- **`sudo` privileges** on all nodes.
-- A [Hugging Face](https://huggingface.co) API token with read access to gated models.
-- Internet access from all nodes to pull Helm charts and container images.
-
-### Hardware (per node)
-
-| Resource | Control-plane node | Worker node |
-|---|---|---|
-| CPU | 48+ cores | 48+ cores |
-| RAM | 32 GB | 32 GB |
-| Disk | 100 GB | 100 GB |
-| OS | Ubuntu 22.04 / 24.04 | Ubuntu 22.04 / 24.04 |
-| Architecture | x86_64 | x86_64 |
+- [Step 1 — Configure `hosts.yaml`](#step-1--configure-hostsyaml)
+- [Step 2 — Configure /etc/hosts and TLS](#step-2--configure-etchosts-and-tls)
+- [Step 3 — Configure agentic-config.cfg](#step-3--configure-agentic-configcfg)
+- [Step 4 — Deploy](#step-4--deploy)
+- [Step 5 — Verify](#step-5--verify)
+- [Step 6 — Semantic Router (Intelligent Query Routing)](#step-6--semantic-router-intelligent-query-routing)
+- [Step 7 — Redis (Shared Memory Backend)](#step-7--redis-shared-memory-backend)
+- [Step 8 — PostgreSQL + pgvector (Vector Store)](#step-8--postgresql--pgvector-vector-store--long-term-memory)
+- [Step 9 — Agent Sandbox (Sandboxed Code Execution)](#step-9--agent-sandbox-sandboxed-code-execution)
+- [Adding a Worker Node to a Running Cluster](#adding-a-worker-node-to-a-running-cluster)
+- [Supported Deployment Topologies](#supported-deployment-topologies)
+- [Notes](#notes)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -70,63 +67,6 @@ all:
       hosts: {}
 ```
 
-### Multi-Master + Multiple Workers (HA — production)
-
-For high-availability control planes, promote additional nodes to `kube_control_plane` and `etcd`. Three control-plane nodes are the minimum for HA etcd quorum.
-
-```yaml
-all:
-  hosts:
-    master1:
-      ansible_host: 10.0.0.1
-      ansible_user: ubuntu
-      ansible_ssh_private_key_file: /home/ubuntu/.ssh/id_rsa
-      ansible_become: true
-    master2:
-      ansible_host: 10.0.0.2
-      ansible_user: ubuntu
-      ansible_ssh_private_key_file: /home/ubuntu/.ssh/id_rsa
-      ansible_become: true
-    master3:
-      ansible_host: 10.0.0.3
-      ansible_user: ubuntu
-      ansible_ssh_private_key_file: /home/ubuntu/.ssh/id_rsa
-      ansible_become: true
-    worker1:
-      ansible_host: 10.0.0.4
-      ansible_user: ubuntu
-      ansible_ssh_private_key_file: /home/ubuntu/.ssh/id_rsa
-      ansible_become: true
-    worker2:
-      ansible_host: 10.0.0.5
-      ansible_user: ubuntu
-      ansible_ssh_private_key_file: /home/ubuntu/.ssh/id_rsa
-      ansible_become: true
-  children:
-    kube_control_plane:
-      hosts:
-        master1:
-        master2:
-        master3:
-    kube_node:
-      hosts:
-        master1:
-        master2:
-        master3:
-        worker1:
-        worker2:
-    etcd:
-      hosts:
-        master1:
-        master2:
-        master3:
-    k8s_cluster:
-      children:
-        kube_control_plane:
-        kube_node:
-    calico_rr:
-      hosts: {}
-```
 
 > **Note:** The node running `./deploy-agentic-stack.sh` must be able to reach all other nodes via SSH using the key specified in `ansible_ssh_private_key_file`.
 
@@ -172,16 +112,17 @@ key_file=/home/ubuntu/certs/key.pem
 Open `core/inventory/agentic-config.cfg` and fill in your values:
 
 ```ini
-cluster_url=api.example.com        # your domain / control-plane FQDN
+# Your cluster FQDN — this becomes the base URL for all services
+cluster_url=api.example.com
 
-cert_file=/home/ubuntu/certs/cert.pem
-key_file=/home/ubuntu/certs/key.pem
-
+# TLS certificate — provide a full-chain cert + private key
+# For a custom domain: supply your CA-signed or self-signed cert/key files
+cert_file=/path/to/your/fullchain.pem
+key_file=/path/to/your/private.key
+# HuggingFace token (required to pull gated models)
 hugging_face_token=hf_xxxxxxxxxxxxxxxxxxxx
-
-models=cpu-qwen3-coder-30b      # model to deploy (see supported models)
-cpu_or_gpu=cpu
-
+# Model to deploy — select the model from the model list (ex :cpu-qwen3-coder-30b)
+models=cpu-qwen3-coder-30b
 # Enable/disable stack components
 deploy_kubernetes_fresh=on
 deploy_ingress_controller=on
@@ -190,8 +131,24 @@ deploy_observability=on
 deploy_llm_models=on
 deploy_redis=on          # standalone Redis Stack in its own namespace
 deploy_pgvector=off      # optional: PostgreSQL 16 + pgvector — shared vector store and long-term memory backend
-
+deploy_agent_sandbox=on  # optional: Agent Sandbox controller — isolated pod environments for safe code execution
+deploy_kuberay=off       # optional
 ```
+
+### Choose your model
+
+Set the `models` field in `agentic-config.cfg` to one value from the table below:
+
+**CPU models** (`cpu_or_gpu=cpu`)
+
+| # | Value to set in `models` | Model |
+|---|---|---|
+| `21` | `cpu-qwen3-coder-30b` | Qwen/Qwen3-Coder-30B-A3B-Instruct |
+| `22` | `cpu-qwen2-5-coder-14b` | Qwen/Qwen2.5-Coder-14B-Instruct *(default — used by the Coding Agent)* |
+| `23` | `cpu-bge-base-en` | BAAI/bge-base-en-v1.5 *(text embedding)* |
+| `24` | `cpu-bge-reranker-base` | BAAI/bge-reranker-base *(reranking)* |
+
+Multiple models can be deployed together using a comma-separated list: `models=cpu-qwen3-coder-30b,cpu-bge-base-en`
 
 ---
 
@@ -204,7 +161,7 @@ chmod +x deploy-agentic-stack.sh
 ./deploy-agentic-stack.sh
 ```
 
-Kubespray will use `core/inventory/hosts.yaml` to provision Kubernetes across all listed nodes (~15–30 min). The remaining stack components are then deployed on top.
+Kubespray will use `core/inventory/hosts.yaml` to provision Kubernetes across all listed nodes (~20–30 min). The remaining stack components are then deployed on top.
 
 ---
 
@@ -217,26 +174,316 @@ After deployment, confirm all nodes joined the cluster and all pods are healthy:
 kubectl get nodes -o wide
 
 # All pods should be Running
+# (the vLLM pod may take an additional 10-15 min to pull the model weights)
 kubectl get pods -A
 
 # Retrieve the LiteLLM master key
 export LITELLM_MASTER_KEY=$(kubectl get deploy -n genai-gateway genai-gateway-deployment \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="LITELLM_MASTER_KEY")].value}')
 
-# Confirm the model API is responding
+# List registered models to confirm the model name
 curl -k https://api.example.com/v1/models \
   -H "Authorization: Bearer ${LITELLM_MASTER_KEY}"
+
+# Test chat completions (use the model name returned by /v1/models above)
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{"model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+       "messages": [{"role":"user","content":"Write a Python hello world"}],
+       "max_tokens": 100}'
+```
+
+> The `LITELLM_MASTER_KEY` is set in the `genai-gateway-deployment` environment variables in the `genai-gateway` namespace.
+
+---
+
+## Step 6 — Semantic Router (Intelligent Query Routing)
+
+Semantic routing automatically directs queries to the most appropriate model based on content analysis using embeddings. This allows you to route simple queries to faster/cheaper CPU models while directing complex tasks to more powerful GPU models or larger CPU models.
+
+**Why Use Semantic Routing?**
+
+- **Cost optimization:** Route simple queries to efficient models, complex ones to powerful models
+- **Latency reduction:** Fast models handle straightforward requests quickly
+- **Intelligent dispatch:** Coding tasks → coding-specialized models, reasoning → larger models
+- **Transparent routing:** Applications use a single model name (e.g., `smart_router`), routing happens server-side
+
+> **📚 For more information:** See the official [LiteLLM Auto Routing documentation](https://docs.litellm.ai/docs/proxy/auto_routing#litellm-proxy-server)
+
+### Prerequisites
+
+- Step 5 complete and base stack verified
+- At least one model deployed (you'll add a second model for routing)
+
+### 1. Deploy a Second Model
+
+Update `core/inventory/agentic-config.cfg` to add a more powerful model alongside your existing one:
+
+```ini
+models=cpu-qwen3-coder-30b,cpu-deepseek-r1-distill-qwen-32b
+cpu_or_gpu=cpu
+```
+
+```bash
+# Re-run the deploy script — already-running components are skipped automatically
+./deploy-agentic-stack.sh
+```
+
+### 2. Deploy Embedding Model for Semantic Matching
+
+Semantic routing requires an embedding model to generate vector representations of user queries. Update `core/inventory/agentic-config.cfg` to include the embedding model:
+
+```ini
+models=cpu-bge-base-en
+```
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+### 3. Access the LiteLLM UI
+
+Navigate to the LiteLLM UI in your browser:
+
+```
+https://api.example.com
+```
+
+Replace `api.example.com` with your actual `cluster_url`.
+
+### 4. Configure Semantic Router via UI
+
+**Step 4a — Verify the Embedding Model:**
+
+1. Navigate to: **Models+Endpoints** → **Models** tab
+2. Look for `BAAI/bge-base-en-v1.5` in the models list
+
+**Step 4b — Configure the Auto Router:**
+
+Navigate to: **Models+Endpoints** → **Add Model** → **Auto Router** Tab
+
+| Field | Value | Description |
+|-------|-------|-------------|
+| **Auto Router Name** | `smart_router` | The model name developers will use in API requests |
+| **Default Model** | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | Fallback model when no route matches |
+| **Embedding Model** | `BAAI/bge-base-en-v1.5` | The embedding model deployed above |
+
+**Configure Routes:**
+
+Click **Add Route** to create routing rules. Configure at least two routes:
+
+**Route 1 — Simple Queries (Smaller/Faster Model):**
+- **Target Model:** `Qwen/Qwen3-Coder-30B-A3B-Instruct`
+- **Utterances:**
+  ```
+  what is [topic]
+  define [term]
+  explain [concept] simply
+  hello
+  write a simple [language] function
+  ```
+- **Score Threshold:** `0.5`
+
+**Route 2 — Complex Queries (More Powerful Model):**
+- **Target Model:** `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
+- **Utterances:**
+  ```
+  design a [system] architecture
+  optimize this [language] code for performance
+  debug this complex [issue]
+  refactor this codebase to use [pattern]
+  implement a distributed [system]
+  create a production-ready [application]
+  how to code a program in [language]
+  ```
+- **Score Threshold:** `0.5`
+
+Click **Save** to activate the semantic router.
+
+### 5. Verify Semantic Routing
+
+```bash
+export LITELLM_MASTER_KEY=$(kubectl get deploy -n genai-gateway genai-gateway-deployment \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="LITELLM_MASTER_KEY")].value}')
+
+# Simple query — should route to the smaller/faster model
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{"model": "smart_router", "messages": [{"role":"user","content":"What is a Python list?"}], "max_tokens": 100}'
+
+# Complex query — should route to the more powerful model
+curl -k https://api.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -d '{"model": "smart_router", "messages": [{"role":"user","content":"How to code a program in Python that implements a distributed task queue with Redis backend"}], "max_tokens": 200}'
+```
+
+Check routing decisions in Langfuse at `https://trace-api.example.com` — look for the `model` field in trace details.
+
+---
+
+## Step 7 — Redis (Shared Memory Backend)
+
+Redis is the **common memory backend** for all agentic workloads in this stack — deploy it before any use-case agent (MCP agents, etc.).
+
+The `core/helm-charts/redis` chart deploys **Redis Stack** (includes RediSearch) into its own `redis` namespace as a single persistent instance shared across all agents.
+
+**Automated deployment (recommended):**
+
+Set `deploy_redis=on` in `core/inventory/agentic-config.cfg` before running `./deploy-agentic-stack.sh`. Redis is deployed automatically as part of the stack.
+
+```ini
+deploy_redis=on
+```
+
+**Manual deployment (alternative / standalone):**
+
+```bash
+# 1. Resolve Helm chart dependencies
+helm dependency build core/helm-charts/redis
+
+# 2. Deploy into the `redis` namespace
+helm upgrade --install redis core/helm-charts/redis \
+  --namespace redis \
+  --create-namespace \
+  --wait --timeout 5m
+```
+
+**Verify it is running:**
+
+```bash
+kubectl get pods -n redis
+# NAME                       READY   STATUS    RESTARTS   AGE
+# redis-stack-server-0       1/1     Running   0          60s
+
+kubectl exec -n redis redis-stack-server-0 -- redis-cli ping
+# PONG
+```
+
+**Redis URL (in-cluster) — use this in all agents:**
+
+```
+redis://redis-stack-server.redis.svc.cluster.local:6379
 ```
 
 ---
 
-## Adding a Worker Node to a Running Cluster
+## Step 8 — PostgreSQL + pgvector (Vector Store & Long-Term Memory)
+
+PostgreSQL 16 with the **pgvector** extension gives every agentic workload a persistent, queryable vector store for long-term memory, RAG pipelines, semantic search, and structured state storage.
+
+**When to enable:**
+- Your agent needs long-term memory that survives pod/session restarts
+- You are building RAG pipelines that store and retrieve embeddings
+- Use cases require structured relational + vector data in the same store
+
+**Enable in `core/inventory/agentic-config.cfg`:**
+
+```ini
+deploy_pgvector=on
+```
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+**What gets deployed:**
+
+| Resource | Detail |
+|---|---|
+| Namespace | `pgvector` |
+| Image | `pgvector/pgvector:pg16` (PostgreSQL 16 + pgvector extension) |
+| Service | `pgvector.pgvector.svc.cluster.local:5432` |
+| Database | `agentdb` |
+| User | `agentuser` |
+| Credentials secret | `pgvector-credentials` in the `pgvector` namespace or available in `core/inventory/metadata/vault.yml` |
+
+**Verify it is running:**
+
+```bash
+kubectl get pods -n pgvector
+# NAME                    READY   STATUS    RESTARTS   AGE
+# pgvector-0              1/1     Running   0          60s
+
+kubectl exec -n pgvector pgvector-0 -- \
+  psql -U agentuser -d agentdb \
+  -c "SELECT extname, extversion FROM pg_extension WHERE extname='vector';"
+# extname | extversion
+# --------+-----------
+# vector  | 0.8.0
+```
+
+**Retrieve the connection string from the cluster secret:**
+
+```bash
+kubectl get secret pgvector-credentials -n pgvector \
+  -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+# postgresql://agentuser:<password>@pgvector.pgvector.svc.cluster.local:5432/agentdb
+```
+
+**In-cluster connection string (for use in agent workloads):**
+
+```
+postgresql://agentuser:<password>@pgvector.pgvector.svc.cluster.local:5432/agentdb
+```
+
+---
+
+## Step 9 — Agent Sandbox (Sandboxed Code Execution)
+
+Agent Sandbox provides **isolated, ephemeral Kubernetes pods** for safe code execution. Every sandbox is a fully self-contained pod — the agent can run arbitrary code, install packages, and write files without touching the host or other workloads.
+
+```ini
+# core/inventory/agentic-config.cfg
+deploy_agent_sandbox=on
+```
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+**What gets deployed** (all in the `agent-sandbox` namespace):
+
+| Component | Description |
+|---|---|
+| `agent-sandbox-controller` | Kubernetes operator that manages Sandbox pod lifecycle |
+| CRDs | `sandboxes`, `sandboxtemplates`, `sandboxclaims`, `sandboxwarmpools` |
+| `sandbox-router` | HTTP proxy that routes SDK requests to sandbox pods |
+| `python-sandbox-template` | Default SandboxTemplate using a locally-built Python runtime |
+
+**Verify:**
+
+```bash
+kubectl get pods -n agent-sandbox
+# NAME                                          READY   STATUS    RESTARTS
+# agent-sandbox-controller-xxx                  1/1     Running   0
+# sandbox-router-deployment-xxx                 1/1     Running   0
+
+kubectl get sandboxtemplate -n agent-sandbox
+# NAME                      AGE
+# python-sandbox-template   1m
+```
+
+> **In-cluster router URL** (used by the in-cluster agent):
+> `http://sandbox-router-svc.agent-sandbox.svc.cluster.local:8080`
+
+For the full guide — adding custom templates, WarmPools, and SDK usage — see **[agent-sandbox.md](agent-sandbox.md)**.
+
+---
 
 To expand a running cluster with an additional worker node:
 
 1. Add the new node's entry to `core/inventory/hosts.yaml` under both `all.hosts` and `kube_node`.
 2. Ensure passwordless SSH is set up from the control-plane node to the new node.
-3. Use the interactive menu:
+3. Either re-run the deploy script (recommended — it detects the new node automatically):
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+Or use the interactive menu:
 
 ```bash
 ./deploy-agentic-stack.sh --menu

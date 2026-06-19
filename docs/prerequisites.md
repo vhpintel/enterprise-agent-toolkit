@@ -6,9 +6,11 @@
 |---|---|---|
 | CPU | 48 cores | 96+ cores |
 | RAM | 32 GB | 64 GB |
-| Disk | 100 GB  | 200 GB  |
+| Disk | 150 GB  | 200 GB  |
 | OS | Ubuntu 22.04 / 24.04 | Ubuntu 22.04 LTS |
 | Architecture | x86_64 | x86_64 |
+
+> **Note:** For tp1, tp2 system should have minimum 128Gi and for tp>=4 minimum 256Gi memory available for the model's pod.
 
 ## Access
 
@@ -66,6 +68,7 @@ Log in as a non-root user with `sudo` privileges. Using `root` or a password-bas
   |---|---|
   | `api.example.com` | GenAI Gateway (LiteLLM) |
   | `trace-api.example.com` | Langfuse trace UI |
+  | `coding-agent-api.example.com` | Coding Agent UI |
 
   Request a **multi-SAN** or **wildcard** (`*.api.example.com`) certificate from your CA that includes all of the above.
 - Set up automatic renewal or calendar reminders before certificates expire.
@@ -86,6 +89,7 @@ For local testing, `api.example.com` can be mapped to `localhost` or the node's 
    sudo bash -c 'cat >> /etc/hosts <<EOF
    127.0.0.1 api.example.com
    127.0.0.1 trace-api.example.com
+   127.0.0.1 coding-agent-api.example.com
    EOF'
    ```
 
@@ -95,6 +99,7 @@ For local testing, `api.example.com` can be mapped to `localhost` or the node's 
    |---|---|
    | `api.example.com` | GenAI Gateway (LiteLLM) |
    | `trace-api.example.com` | Langfuse trace UI |
+   | `coding-agent-api.example.com` | Coding Agent UI |
 
 2. **Generate a self-signed SSL certificate** covering all subdomains:
 
@@ -105,7 +110,7 @@ For local testing, `api.example.com` can be mapped to `localhost` or the node's 
    mkdir -p ~/certs && cd ~/certs && \
    openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
      -subj "/CN=${DOMAIN}" \
-     -addext "subjectAltName = DNS:${DOMAIN}, DNS:trace-${DOMAIN}"
+     -addext "subjectAltName = DNS:${DOMAIN}, DNS:trace-${DOMAIN}, DNS:coding-agent-${DOMAIN}"
    ```
 
    > **Note:** The `-addext` option requires OpenSSL ≥ 1.1.1. If you add more use cases later, regenerate the cert with the additional `DNS:` entries.

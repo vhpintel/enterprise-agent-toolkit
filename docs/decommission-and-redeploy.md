@@ -30,7 +30,7 @@ After decommission completes, set the components you want back to `on` in `agent
 #   deploy_observability=on
 #   deploy_llm_models=on
 #   deploy_redis=on
-#   deploy_pgvector=on
+#   deploy_pgvector=off
 
 ./deploy-agentic-stack.sh
 ```

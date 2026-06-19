@@ -1,72 +1,210 @@
+# Intel® AI for Enterprise Agent Toolkit — Open Source Agentic AI Platform on Kubernetes
 
-# Intel® AI for Enterprise Agent Toolkit
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/intel/enterprise-agent-toolkit/blob/main/LICENSE)
+[![Platform: Intel Xeon](https://img.shields.io/badge/Platform-Intel%C2%AE%20Xeon%C2%AE-0068B5)](https://www.intel.com/xeon)
+[![Deployment: Kubernetes](https://img.shields.io/badge/Deployment-Kubernetes-326CE5)](https://kubernetes.io)
+[![Gateway: LiteLLM](https://img.shields.io/badge/Gateway-LiteLLM-green)](https://litellm.ai)
+[![Frameworks: LangGraph · CrewAI · Flowise](https://img.shields.io/badge/Frameworks-LangGraph%20%C2%B7%20CrewAI%20%C2%B7%20Flowwise-orange)](https://github.com/intel/enterprise-agent-toolkit)
 
-A batteries‑included agentic AI stack optimized for Intel® Xeon, delivering ready‑to‑deploy components for memory, sandboxing, tools, orchestration, and governance.
+> **Deploy a production-grade, open source agentic AI stack on Intel® Xeon® in hours — not months.**
+> A batteries-included Kubernetes platform with API gateway, intelligent inference routing, agent memory, sandboxed code execution, MCP tool integration, and full agent and system observability — all pre-integrated and ready to run.
 
-This repo gives one-click deployment of a Agentic AI platform.
-
-Deploys a full Kubernetes-based stack with GenAI Gateway (LiteLLM + Langfuse), observability (Prometheus + Grafana), Redis (shared memory backend), PostgreSQL + pgvector (vector store), and the user-selected SLM or LLM model for Intel® Xeon or Intel® AI Accelerator.
+**Keywords:** agentic AI platform · enterprise AI agents · open source AI agent stack · Kubernetes AI deployment · LLM inference on CPU · Intel Xeon AI · LiteLLM gateway · AI agent memory RAG · on-premise LLM deployment · private AI infrastructure · AI agent observability · MCP server Kubernetes · vLLM sglang Intel · Enterprise Agnet Toolkit 
 
 ---
 
 ## Table of Contents
 
-- [What is the Intel® AI for Enterprise Agent Toolkit?](#what-is-the-intel-ai-for-enterprise-agent-toolkit)
-- [Platform Capabilities](#platform-capabilities)
-- [Prerequisites](docs/prerequisites.md)
-- [Quick Start](docs/quick-start.md)
-- [Decommission / Reset and Redeploy](docs/decommission-and-redeploy.md)
-- [License](#license)
+- [Why This Matters](#why-this-matters)
+- [Business Value at a Glance](#business-value-at-a-glance)
+- [Architecture](#architecture)
+- [Provider Design Pattern](#provider-design-pattern)
+- [Provider Blocks](#provider-blocks)
+  - [API Gateway & Access Control](#api-gateway--access-control)
+  - [Intelligent Inference Routing](#intelligent-inference-routing)
+  - [Actions & Tools](#actions--tools)
+  - [Code Execution & Sandbox](#code-execution--sandbox)
+  - [Memory, State & Context](#memory-state--context)
+  - [Observability & Telemetry](#observability--telemetry)
+  - [Deployment & Orchestration](#deployment--orchestration)
+- [Infrastructure Core](#infrastructure-core)
+- [Validated Orchestration Frameworks](#validated-orchestration-frameworks)
+- [Example Business Use Cases](#example-business-use-cases-not-pre-bundled)
+- [Deployment Model](#deployment-model)
+- [Build vs. Build-from-Scratch](#build-vs-build-from-scratch)
+- [Frequently Asked Questions](#frequently-asked-questions)
+- [Repository Structure](#repository-structure)
+- [Links](#links)
 
 ---
 
-## What is the Intel® AI for Enterprise Agent Toolkit?
+## Why This Matters
 
-The Intel® AI for Enterprise Agent Toolkit is a production-ready, Kubernetes-based platform that turns single or multi server into a fully operational AI agent infrastructure. It bundles every layer an enterprise needs to build, run, and govern AI agents — from secure API routing and intelligent model dispatch, to sandboxed code execution, persistent agent memory, and real-time observability.
+AI agents are not just smarter chatbots — they are autonomous systems that plan, act, and iterate across multi-step tasks. Building a production-ready agentic AI platform from scratch requires solving a dozen infrastructure problems simultaneously: secure API access, LLM inference routing, agent memory and state management, sandboxed code execution, LLM observability, and enterprise governance.
 
-Built on Intel® Xeon® Scalable processors (and optionally Intel® AI Accelerators), the stack is optimized for CPU-efficient inference out of the box and is designed to grow: models endpoints deployed on GPU or cloud can be added to the same gateway at any time.
+Most organizations waste months stitching together LiteLLM, Redis, pgvector, Kubernetes, Langfuse, and agent sandboxes. This open source toolkit delivers them pre-integrated, pre-optimized for Intel® Xeon®, and deployable in a single automated workflow.
 
-### Architecture Flow Diagram
-
-![Architecture Flow Diagram](docs/pictures/Enterprise-Agent-Toolkit-Arch-Diagram.png)
+**The core insight:** GPUs accelerate reasoning. But the *value* of agentic AI comes from end-to-end task execution — and that control plane (state, tools, policy, coordination) runs efficiently on CPUs. This toolkit is designed around that reality, making it the ideal platform for cost-efficient, on-premise, and private AI deployments.
 
 ---
 
-## Platform Capabilities
+## Business Value at a Glance
+
+| Problem | What the Toolkit Delivers |
+|---|---|
+| Long time-to-production | One-click Kubernetes deployment — base stack live in hours |
+| Integration complexity | All layers pre-integrated: gateway, memory, sandbox, observability |
+| Vendor lock-in risk | Provider Design Pattern — swap or extend any component without re-architecting |
+| Governance & compliance gaps | Policy-driven API gateway, sandboxed execution, full audit trail |
+| GPU cost dependency | CPU-efficient LLM inference by default on Xeon; GPU addable on demand |
+| Observability blind spots | Every token, latency, and agent step captured and queryable |
+| Adoption friction | Works with LangGraph, CrewAI, Flowise, Microsoft Agent Framework, and any OpenAI-compatible framework |
+
+---
+
+## Architecture
+
+![Intel® AI for Enterprise Agent Toolkit Architecture](docs/pictures/Enterprise-Agent-Toolkit-Arch-Diagram.png)
+
+The toolkit is organized into **seven pluggable provider blocks**, each with a default implementation and a defined interface. Customers can use the defaults on day one and swap or extend individual providers as their needs evolve — without touching any other layer.
+
+---
+
+## Provider Design Pattern
+
+Each functional block in the toolkit follows a **Provider Design Pattern**: the block defines the capability contract (what it does), not the implementation (how it does it). The default provider is Intel-validated and optimized for Xeon out of the box. Any standard-compliant alternative can be substituted.
+
+This means:
+- **No big-bang replacements.** Swap one provider at a time.
+- **No lock-in.** The toolkit never mandates a proprietary runtime.
+- **Incremental adoption.** Start with all defaults; introduce your own components over time.
+
+---
+
+## Provider Blocks
+
+Each functional block ships with an Intel-validated default. Because the toolkit is built on the Provider Design Pattern, any block can be swapped or extended independently — without touching the rest of the stack.
 
 ### API Gateway & Access Control
-Unified, secure API entry point with policy-driven routing, rate limiting, and enterprise-grade authentication and authorization for agents, tools, and applications. Powered by **LiteLLM** (OpenAI-compatible gateway) every request is authenticated and governed before it reaches a model or tool.
+Unified, secure entry point for all agents, tools, and applications. Routes every request through a policy-driven layer that enforces authentication, authorization, and rate limiting before anything reaches a model or tool. Supports any OpenAI-compatible backend — cloud, on-premise, or hybrid.
 
-### Intelligent Routing
-Automatically routes inference workloads to CPUs or GPUs based on the intent of the request — reasoning and planning tasks can be routed to GPU/cloud model endpoints while act/execute can be routed to CPU model endpoints. The routing layer is model-agnostic and supports any OpenAI-compatible backend. 
+**Default provider:** LiteLLM
 
-### Actions & Sandbox
-Enables safe agent actions through sandboxed code execution, tool isolation, and policy-driven governance to control blast radius and ensure enterprise compliance. The **Agent Sandbox** controller ([kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)) provides isolated, ephemeral Kubernetes pod environments — each sandbox is a fully self-contained pod with its own filesystem and process tree.
+---
+
+### Intelligent Inference Routing
+Automatically dispatches LLM inference workloads to the optimal compute target based on task intent. Reasoning and planning tasks are routed to GPU or cloud/MaaS endpoints; execution, encoding, and coordination tasks are routed to CPU on Xeon. Rules are configurable per application and model-agnostic — works with OpenAI, Anthropic Claude, Google Gemini, and any self-hosted model.
+
+**Default provider:** LiteLLM Semantic Router · Intel Native Inferencing Service (vLLM, SGLang)
+
+---
+
+### Actions & Tools
+Gives agents the ability to take actions in the world — call APIs, run code, query databases, and invoke external services — through a governed and extensible tool layer. MCP (Model Context Protocol) server templates let teams register domain-specific tools without modifying the core stack.
+
+**Default provider:** Intel MCP (Model Context Protocol) · ETL / Ingestion Services
+
+---
+
+### Code Execution & Sandbox
+Enables agents to safely execute code and run arbitrary actions in isolated environments, preventing runaway agents from affecting production systems. Each sandbox is a fully self-contained ephemeral Kubernetes pod with its own filesystem and process tree. Policy controls limit the blast radius of any single agent action.
+
+**Default provider:** `kubernetes-sigs/agent-sandbox`
+
+---
 
 ### Memory, State & Context
-Provides scalable short- and long-term agent memory using vector databases and relational stores to maintain context across tasks, sessions, and workflows. **Redis** (with RediSearch) is deployed as the default memory backend, giving agents persistent session state, semantic search over past interactions, and cross-request continuity.
+Maintains agent memory across the full lifecycle — short-term working context within a session and long-term knowledge across sessions and users. Enables RAG (Retrieval-Augmented Generation), semantic search over past interactions, and stateful multi-turn workflows. Agents maintain context across tasks, sessions, and workflows.
 
-### Intel Tools & MCP
-Accelerates agent actions via Intel-optimized tools, **Model Context Protocol (MCP)** integrations, classic AI/ML pipelines and ingestion/ETL services. MCP server templates are included for extending the agent with domain-specific tooling without modifying the core stack.
+**Default provider:** Redis + RediSearch (short-term) · PostgreSQL + pgvector (long-term)
 
-### Orchestration
-Orchestrates all agent workloads with **Kubernetes** (via Kubespray), **Helm**, and an Ansible-based automation layer. The stack supports distributed execution, rolling updates, high-availability scaling, and multi-node expansion out of the box.
+---
 
 ### Observability & Telemetry
-Integrates seamlessly with enterprise monitoring tooling, providing real-time metrics, traces, and logs through **Prometheus**, **Grafana**, **Loki**, and **Langfuse** (LLM-native tracing). Every token, latency measurement, and agent step is captured and queryable from the included dashboards.
+Every token, latency measurement, and agent step is captured, stored, and queryable. Provides LLM-native tracing for debugging agent reasoning chains, out-of-the-box dashboards, and seamless integration with existing enterprise monitoring infrastructure — no custom instrumentation required.
+
+**Default provider:** Langfuse · Prometheus · Grafana · Loki
 
 ---
 
-## Prerequisites
+### Deployment & Orchestration
+Manages the full lifecycle of the stack — provisioning, scaling, updates, and teardown — across single-node and multi-node environments. Supports both production Kubernetes clusters and lightweight Docker Compose for development and demos, using the same configuration.
 
+**Default provider:** Kubernetes · Helm · Docker Compose
+
+---
+
+## Infrastructure Core
+
+All provider blocks run on a common infrastructure foundation:
+
+| Layer | Details |
+|---|---|
+| **Operating System** | Ubuntu 24.04 LTS / RHEL |
+| **CPU Configuration** | Intel® Xeon® — NUMA tuning, firmware, drivers, AMX enabled |
+| **Compute & Runtime** | Intel® Xeon® · Intel® AI Accelerators · Intel® Arc™ |
+| **Supported Model APIs** | OpenAI · Anthropic Claude · Google Gemini · SambaNova · local models via vLLM / SGLang |
+
+---
+
+## Validated Orchestration Frameworks
+
+| Framework | Style |
+|---|---|
+| **LangGraph** | State-machine, multi-step agent workflows |
+| **Flowise** | Low-code visual pipeline builder |
+| **CrewAI** | Role-based multi-agent collaboration |
+| **OpenClaw** | Intel-optimized agentic framework |
+
+---
+
+## Example Business Use Cases (Not pre-bundled)
+
+| Use Case | Description |
+|---|---|
+| **Coding Agent** | Automated code generation, review, test, and fix loops — accelerates developer productivity |
+| **Deep Research Agent** | Multi-step web and knowledge base research with citation; replaces hours of analyst work |
+| **Flowise Agents** | Low-code visual agent pipeline construction for business teams |
+| **Customer Support Automation** | RAG-augmented, multi-turn resolution with memory — reduces ticket handle time |
+| **Enterprise Data Analyst** | Natural language to SQL/report across internal databases — self-serve analytics |
+| **IT Operations Agent** | Infrastructure monitoring, alerting, and self-healing workflows — reduces MTTR |
+
+---
+
+## Deployment Model
+
+### Deployment Options
+
+| Option | Stack | Best For |
+|---|---|---|
+| **Multi-node Kubernetes** | Kubespray + Helm + KubeRay (for Parallel Tool Calling) | Production, HA, scale-out |
+| **Single-node Kubernetes** | K8s + Helm | Pilot, staging, edge |
+| **Docker Compose** | Docker Compose | Development, demos, single machine |
+
+### How to Deploy
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/intel/enterprise-agent-toolkit.git
+cd enterprise-agent-toolkit
+```
+
+### 2. Complete prerequisites
 Hardware requirements, SSH key setup, and DNS/TLS configuration are covered in **[Prerequisites Guide](docs/prerequisites.md)**.
 
+### 3. Quick Start
+
+The full step-by-step deployment guide — covering the base stack, semantic routing, Redis, pgvector, and Agent Sandbox — is in **[Quick Start Guide](docs/README.md)**.
+
+
+**Estimated time to first running agent: hours, not months.**
+
 ---
 
-## Quick Start
+## Backend Connection Reference
 
-The full step-by-step deployment guide — covering the base stack, semantic routing, Redis, pgvector, and Agent Sandbox — is in **[Quick Start Guide](docs/quick-start.md)**.
-
+In-cluster URLs for all shared backends (Redis, Agent Sandbox, pgvector, KubeRay, Flowise). See **[Backend Connection Reference](docs/backend-connection-reference.md)** for the full reference.
 
 ---
 
@@ -76,18 +214,60 @@ To tear down the cluster and redeploy from scratch, see **[Decommission and Rede
 
 ---
 
-## License
+## Build vs. Build-from-Scratch
 
-Licensed under the [Apache License Version 2.0](LICENSE).
+| Dimension | Build from Scratch | Intel® Toolkit |
+|---|---|---|
+| Time to production | 3–6 months | Hours to days |
+| Vendor lock-in | None | None (Apache 2.0) |
+| Component flexibility | Full (you build it) | Full (Provider Pattern) |
+| GPU dependency | Your choice | Optional |
+| Data residency | Full control | Full control |
+| Enterprise governance | You build it | Built-in |
+| Intel® Xeon® optimization | Manual | Native |
+| Total cost of ownership | High | Low (open source + Xeon) |
 
-## Security
+---
 
-The [Security Policy](SECURITY.md) outlines our guidelines and procedures for ensuring the highest level of security and trust for our users who consume Intel® AI for Enterprise Agent Toolkit.
+## Frequently Asked Questions
 
-## Trademark Information
+**What is the Intel® AI for Enterprise Agent Toolkit?**
+An open source, Kubernetes-based platform that gives enterprises everything they need to deploy, run, and govern production AI agents on Intel® Xeon® — including LLM gateway, inference routing, agent memory, sandboxed execution, MCP tool integration, and full observability.
 
-Intel, the Intel logo, Xeon are trademarks of Intel Corporation or its subsidiaries.
+**How is this different from LangChain, LangGraph, or CrewAI?**
+LangGraph, CrewAI, and similar frameworks handle agent orchestration logic. This toolkit provides the production infrastructure underneath them — the API gateway, inference routing, memory store, sandbox, and observability layer. You use LangGraph or CrewAI *on top of* this toolkit.
 
-Other names and brands may be claimed as the property of others.
+**Does it require a GPU?**
+No. The toolkit is designed to run AI agent workloads efficiently on Intel® Xeon® CPUs using AMX acceleration. GPU or cloud LLM endpoints (OpenAI, Anthropic, Google) can be added to the same gateway for reasoning-heavy tasks.
 
-&copy; Intel Corporation
+**Can I use it with OpenAI, Anthropic Claude, or Google Gemini?**
+Yes. The LiteLLM API gateway is fully OpenAI-compatible and supports all major model providers — OpenAI, Anthropic Claude, Google Gemini, SambaNova, and any self-hosted model via vLLM or SGLang.
+
+**Is this suitable for on-premise or air-gapped deployments?**
+Yes. The full stack runs on bare metal or private cloud Intel® Xeon® servers with no external dependencies required. Ideal for regulated industries requiring data residency and private AI deployments.
+
+**Can I replace individual components?**
+Yes — this is the core design principle. The toolkit is built on the Provider Design Pattern: each block (gateway, memory, observability, etc.) has a default but can be swapped independently without touching other layers.
+
+**What agent frameworks does it support?**
+LangGraph, CrewAI, Flowwise, OpenClaw, and any Python-based or OpenAI-compatible orchestration framework.
+
+**How do I get started?**
+Clone the repo, run `./deploy-agentic-stack.sh`, and follow the [Quick Start Guide](docs/README.md).
+
+
+**License:** Apache 2.0 · **Primary languages:** Shell (88%), Jinja (10%), Go Template (2%)
+
+---
+
+## Links
+
+- [GitHub Repository](https://github.com/intel/enterprise-agent-toolkit)
+- [Quick Start Guide](docs/README.md)
+- [Prerequisites](docs/prerequisites.md)
+- [Decommission & Redeploy](docs/decommission-and-redeploy.md)
+
+---
+
+*Intel®, Intel® Xeon®, and Intel® Arc™ are registered trademarks of Intel Corporation or its subsidiaries.*
+*Licensed under the Apache License, Version 2.0.*

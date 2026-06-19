@@ -1,3 +1,5 @@
+# Quick Start — Intel® AI for Enterprise Agent Toolkit
+This guide provides step-by-step instructions on how to deploy the Intel AI for Enterprise Agent Toolkit on a single node.
 
 ## Table of Contents
 
@@ -6,13 +8,13 @@
 - [Step 1b — Semantic Router](#step-1b--semantic-router-intelligent-query-routing)
 - [Step 2 — Redis (Shared Memory Backend)](#step-2--redis-shared-memory-backend)
 - [Step 2b — PostgreSQL + pgvector (Vector Store)](#step-2b--postgresql--pgvector-vector-store--long-term-memory)
+- [Step 2c — Agent Sandbox (Sandboxed Code Execution)](#step-2c--agent-sandbox-sandboxed-code-execution)
 
 ---
 
 ## Step 1 — Base Stack
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/intel/enterprise-agent-toolkit.git
 cd enterprise-agent-toolkit
 ```
@@ -23,20 +25,16 @@ Open `core/inventory/agentic-config.cfg` and fill in your values:
 
 ```ini
 # Your cluster FQDN — this becomes the base URL for all services
-cluster_url=api.example.com     # change to your domain e.g. intel.edge.com
+cluster_url=api.example.com
 
 # TLS certificate — provide a full-chain cert + private key
 # For a custom domain: supply your CA-signed or self-signed cert/key files
 cert_file=/path/to/your/fullchain.pem
 key_file=/path/to/your/private.key
-
 # HuggingFace token (required to pull gated models)
 hugging_face_token=hf_xxxxxxxxxxxxxxxxxxxx
-
 # Model to deploy — select the model from the model list (ex :cpu-qwen3-coder-30b)
 models=cpu-qwen3-coder-30b
-cpu_or_gpu=cpu
-
 # Enable/disable stack components
 deploy_kubernetes_fresh=on
 deploy_ingress_controller=on
@@ -45,6 +43,8 @@ deploy_observability=on
 deploy_llm_models=on
 deploy_redis=on          # standalone Redis Stack in its own namespace
 deploy_pgvector=off      # optional: PostgreSQL 16 + pgvector — shared vector store and long-term memory backend
+deploy_agent_sandbox=on  # optional: Agent Sandbox controller — isolated pod environments for safe code execution
+deploy_kuberay=off       # optional
 ```
 
 ### 3. Choose your model
@@ -55,14 +55,12 @@ Set the `models` field in `agentic-config.cfg` to one value from the table below
 
 | # | Value to set in `models` | Model |
 |---|---|---|
-| `21` | `cpu-llama-8b` | meta-llama/Llama-3.1-8B-Instruct |
-| `22` | `cpu-qwen3-coder-30b` | Qwen/Qwen3-Coder-30B-A3B-Instruct |
-| `23` | `cpu-qwen2-5-coder-14b` | Qwen/Qwen2.5-Coder-14B-Instruct |
-| `24` | `cpu-whisper-small` | openai/whisper-small |
-| `25` | `cpu-tei` | BAAI/bge-base-en-v1.5 *(text embedding)* |
-| `26` | `cpu-rerank` | BAAI/bge-reranker-base *(reranking)* |
+| `21` | `cpu-qwen3-coder-30b` | Qwen/Qwen3-Coder-30B-A3B-Instruct |
+| `22` | `cpu-qwen2-5-coder-14b` | Qwen/Qwen2.5-Coder-14B-Instruct *(default — used by the Coding Agent)* |
+| `23` | `cpu-bge-base-en` | BAAI/bge-base-en-v1.5 *(text embedding)* |
+| `24` | `cpu-bge-reranker-base` | BAAI/bge-reranker-base *(reranking)* |
 
-Multiple models can be deployed together using a comma-separated list: `models=cpu-qwen3-coder-30b,cpu-llama-8b`
+Multiple models can be deployed together using a comma-separated list: `models=cpu-qwen3-coder-30b,cpu-bge-base-en`
 
 ### 4. Run the deployment
 
@@ -70,21 +68,6 @@ Multiple models can be deployed together using a comma-separated list: `models=c
 chmod +x deploy-agentic-stack.sh
 ./deploy-agentic-stack.sh
 ```
-
-**What the script does automatically:**
-
-| Step | Action |
-|---|---|
-| 1 | Detect OS, architecture, and package manager |
-| 2 | Install system prerequisites (`git`, `curl`, `python3`, etc.) |
-| 3 | Configure passwordless SSH to localhost |
-| 4 | Generate or reuse TLS certificate for `cluster_url` |
-| 5 | Add `cluster_url` → `127.0.0.1` to `/etc/hosts` (if not DNS-resolvable) |
-| 6 | Install Kubernetes via Kubespray (~15 min) |
-| 7 | Deploy NGINX Ingress Controller |
-| 8 | Deploy LiteLLM + Redis + Langfuse (GenAI Gateway) |
-| 9 | Deploy Prometheus + Grafana + Loki (Observability) |
-| 10 | Deploy selected model(s) via vLLM CPU or GPU |
 
 **Estimated time:** 20–40 minutes on a fresh node.
 
@@ -174,7 +157,7 @@ Semantic routing requires an embedding model to generate vector representations 
 
 ```ini
 # Add embedding model to your existing models
-models=cpu-tei
+models=cpu-bge-base-en
 ```
 
 **Deploy the embedding model:**
@@ -318,12 +301,13 @@ Look for the `model` field in the trace details to confirm routing decisions.
 
 ## Step 2 — Redis (Shared Memory Backend)
 
-Redis is the **common memory backend** for all agentic workloads in this stack — deploy it before any use-case agent.
+Redis is the **common memory backend** for all agentic workloads in this stack — deploy it before any use-case agent (MCP agents, etc.).
+
 The `core/helm-charts/redis` chart deploys **Redis Stack** (includes RediSearch) into its own `redis` namespace as a single persistent instance shared across all agents.
 
 **Automated deployment (recommended):**
 
-Set `deploy_redis=on` in `core/inventory/agentic-config.cfg` before running `./deploy-agentic-stack.sh`. Redis is deployed automatically as part of the stack, in the correct order.
+Set `deploy_redis=on` in `core/inventory/agentic-config.cfg` before running `./deploy-agentic-stack.sh`. Redis is deployed automatically as part of the stack, in the correct order .
 
 ```ini
 deploy_redis=on
@@ -426,3 +410,51 @@ kubectl get secret pgvector-credentials -n pgvector \
 ```
 postgresql://agentuser:<password>@pgvector.pgvector.svc.cluster.local:5432/agentdb
 ```
+
+---
+
+## Step 2c — Agent Sandbox (Sandboxed Code Execution)
+
+Agent Sandbox provides **isolated, ephemeral Kubernetes pods** for safe code execution.
+Every sandbox is a fully self-contained pod — the agent can run arbitrary code, install
+packages, and write files without touching the host or other workloads.
+
+
+```ini
+# core/inventory/agentic-config.cfg
+deploy_agent_sandbox=on
+```
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+**What gets deployed** (all in the `agent-sandbox` namespace):
+
+| Component | Description |
+|---|---|
+| `agent-sandbox-controller` | Kubernetes operator that manages Sandbox pod lifecycle |
+| CRDs | `sandboxes`, `sandboxtemplates`, `sandboxclaims`, `sandboxwarmpools` |
+| `sandbox-router` | HTTP proxy that routes SDK requests to sandbox pods |
+| `python-sandbox-template` | Default SandboxTemplate using a locally-built Python runtime |
+
+**Verify:**
+
+```bash
+kubectl get pods -n agent-sandbox
+# NAME                                          READY   STATUS    RESTARTS
+# agent-sandbox-controller-xxx                  1/1     Running   0
+# sandbox-router-deployment-xxx                 1/1     Running   0
+
+kubectl get sandboxtemplate -n agent-sandbox
+# NAME                      AGE
+# python-sandbox-template   1m
+```
+
+> **In-cluster router URL** (used by the in-cluster agent):
+> `http://sandbox-router-svc.agent-sandbox.svc.cluster.local:8080`
+
+For the full guide — adding custom templates, WarmPools, and SDK usage — see
+**[agent-sandbox.md](agent-sandbox.md)**.
+
+---

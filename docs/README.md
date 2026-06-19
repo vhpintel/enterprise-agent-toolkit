@@ -1,5 +1,9 @@
 # Quick Start — Intel® AI for Enterprise Agent Toolkit
 
+
+## Prerequisites
+Complete all [prerequisites](./prerequisites.md).
+
 ## Deployment Options
 
 | Deployment Option | Description | Guide |
