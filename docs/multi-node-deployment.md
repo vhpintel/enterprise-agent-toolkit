@@ -132,6 +132,7 @@ deploy_llm_models=on
 deploy_redis=on          # standalone Redis Stack in its own namespace
 deploy_pgvector=off      # optional: PostgreSQL 16 + pgvector — shared vector store and long-term memory backend
 deploy_agent_sandbox=on  # optional: Agent Sandbox controller — isolated pod environments for safe code execution
+deploy_openshell=off     # optional: NVIDIA OpenShell policy-enforced sandboxes (requires deploy_agent_sandbox=on)
 deploy_kuberay=off       # optional
 ```
 
