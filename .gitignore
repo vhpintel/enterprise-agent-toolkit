@@ -1,6 +1,9 @@
 # Runtime logs
 deploy.log
 
+# Python bytecode cache (e.g. from deploy/aws/validate-template.py)
+__pycache__/
+
 # Kubespray clone (large, fetched at deploy time)
 core/kubespray/
 

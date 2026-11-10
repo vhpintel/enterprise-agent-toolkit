@@ -1,0 +1,1825 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Intel AI for Enterprise Agent Toolkit - agentic AI control plane on a single Intel
+  Xeon EC2 instance. Reasoning is offloaded to Amazon Bedrock; everything around it
+  runs on Xeon CPU - LiteLLM gateway, content-safety guardrail (AMX), agent memory
+  and retrieval, Agent Sandbox (optionally Kata microVMs), OpenShell, observability.
+
+Metadata:
+  # E6101: the cfn-lint schema types WaitCondition.Data as an object, but CloudFormation
+  # resolves it to a JSON string ({"eat-bootstrap":"READY..."}) and accepts it as an
+  # Output value. It is the only E6101 hit; the rule is otherwise clean.
+  cfn-lint:
+    config:
+      ignore_checks: [E6101]
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Network (existing VPC - nothing is created)}
+        Parameters: [VpcId, SubnetId, AdminIngressCidr, AssignPublicIp]
+      - Label: {default: Compute}
+        Parameters: [InstanceType, AmiId, RootVolumeSizeGb, KeyName]
+      - Label: {default: Bedrock}
+        Parameters: [BedrockRegion, BedrockChatModels, BedrockEmbedModel, CreateBedrockVpcEndpoint]
+      - Label: {default: Agentic components}
+        Parameters:
+          - MemoryBackend
+          - DeployGuardrails
+          - DeployAgentSandbox
+          - SandboxIsolation
+          - DeployOpenShell
+          - DeployObservability
+          - DeploySemanticRouter
+          - DeployLocalModels
+          - DeployFlowisePlugin
+      - Label: {default: Memory (used when MemoryBackend=opensearch)}
+        Parameters:
+          - OpenSearchDomainName
+          - OpenSearchEngineVersion
+          - OpenSearchInstanceType
+          - OpenSearchInstanceCount
+          - OpenSearchVolumeSizeGb
+          - OpenSearchSessionTtlHours
+          - SeedSampleData
+      - Label: {default: Toolkit}
+        Parameters: [ClusterDomain]
+      - Label: {default: Notifications}
+        Parameters: [NotificationEmail]
+      - Label: {default: Diagnostics}
+        Parameters: [DiagnosticsS3Bucket]
+      - Label: {default: Proxy (leave empty when the subnet has direct egress)}
+        Parameters: [HttpProxy, NoProxyExtra]
+      # Only consulted when AmiId is NOT a prebuilt toolkit image - see AmiId.
+      - Label: {default: Advanced - toolkit source (ignored on the prebuilt image)}
+        Parameters: [ToolkitRepoUrl, ToolkitGitRef, ToolkitRepoTokenSecret, CodeOverlayS3Bucket, CodeOverlayS3Key]
+    ParameterLabels:
+      AmiId: {default: Toolkit AMI}
+      MemoryBackend: {default: Agent memory and retrieval backend}
+      SandboxIsolation: {default: Sandbox isolation runtime}
+      ToolkitRepoTokenSecret: {default: Git token secret (private repos only)}
+      AssignPublicIp: {default: Assign a public IPv4 (only for public subnets with no NAT)}
+      CodeOverlayS3Bucket: {default: Code overlay S3 bucket (optional)}
+      CodeOverlayS3Key: {default: Code overlay S3 key}
+      DiagnosticsS3Bucket: {default: Bootstrap log bucket (defaults to the overlay bucket)}
+      KeyName: {default: SSH key pair (optional - SSM works without one)}
+      NotificationEmail: {default: Notify this address when ready}
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      Existing VPC to deploy into. Nothing network-level is created except the
+      security groups and (optionally) the Bedrock interface endpoint.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Subnet for the instance and the OpenSearch domain. Must have outbound internet
+      access, because Kubernetes binaries and container images are pulled at deploy
+      time: either a private subnet whose 0.0.0.0/0 route is a NAT gateway, a public
+      subnet (Internet gateway route) with AssignPublicIp=true, or any subnet plus
+      HttpProxy. SSM shell access works over the same egress path.
+
+  AdminIngressCidr:
+    Type: String
+    # Prefix /1-/32 only: a /0 (the whole internet) is rejected at parameter
+    # validation, per Marketplace policy. A Rules assertion is not used because it
+    # is not enforced on change sets.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/([1-9]|[12]\d|3[0-2])$'
+    ConstraintDescription: must be an IPv4 CIDR with prefix /1-/32, such as 10.0.0.0/16 (0.0.0.0/0 is not allowed)
+    Description: >-
+      CIDR allowed to reach ingress-nginx on 80/443 (and SSH on 22 if KeyName is set).
+      Keep this to your VPC CIDR or narrower - reach the UIs from your laptop via SSM
+      port-forward rather than by widening this. 0.0.0.0/0 is rejected.
+
+  AssignPublicIp:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Give the instance a public IPv4 address. Needed ONLY when SubnetId is a public
+      subnet (Internet gateway route) with no NAT gateway - without it such a subnet
+      has no egress and the bootstrap fails. Leave false for NAT or proxy subnets: a
+      public IPv4 is billed hourly. Ingress is still limited to AdminIngressCidr.
+
+  InstanceType:
+    Type: String
+    Default: r8i.24xlarge
+    # Intel Xeon 6 (8th-generation Intel) families only, so the listing itself says
+    # which hardware this runs on: c8i (2 GiB/vCPU), m8i (4 GiB/vCPU), r8i (8 GiB/vCPU).
+    # Sizes below 32 vCPU or 128 GiB are left out - the cluster, gateway and guard model
+    # do not fit. All three families support the nested virtualization Kata needs.
+    AllowedValues:
+      - c8i.16xlarge
+      - c8i.24xlarge
+      - c8i.32xlarge
+      - c8i.48xlarge
+      - c8i.96xlarge
+      - m8i.8xlarge
+      - m8i.12xlarge
+      - m8i.16xlarge
+      - m8i.24xlarge
+      - m8i.32xlarge
+      - m8i.48xlarge
+      - m8i.96xlarge
+      - r8i.8xlarge
+      - r8i.12xlarge
+      - r8i.16xlarge
+      - r8i.24xlarge
+      - r8i.32xlarge
+      - r8i.48xlarge
+      - r8i.96xlarge
+    Description: >-
+      Intel Xeon 6 instance: c8i (compute-optimised, 2 GiB per vCPU), m8i (general
+      purpose, 4 GiB per vCPU) or r8i (memory-optimised, 8 GiB per vCPU). The default
+      r8i.24xlarge (96 vCPU / 768 GiB) is the validated size and meets the toolkit's
+      96+ vCPU recommendation. 32 vCPU and 128 GiB is the floor (c8i.16xlarge,
+      m8i.8xlarge, r8i.8xlarge) for a Bedrock-backed deploy with no local models.
+      Check the type is offered in your region and AZ (aws ec2
+      describe-instance-type-offerings) before launching.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: >-
+      SSM parameter that resolves to the toolkit AMI. When launched from AWS
+      Marketplace this is set for you. Otherwise pass the parameter written by
+      ami/build-ami.sh (e.g. /eat/ami/latest) to use a prebuilt image, or keep the
+      default - stock Ubuntu 24.04 LTS - to install the toolkit from ToolkitRepoUrl
+      at boot.
+
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 300
+    MinValue: 150
+    MaxValue: 2000
+    Description: >-
+      Root volume size in GiB. Stock cloud images ship an 8 GiB root, far too small -
+      a deployed stack uses ~98 GiB, of which ~30 GiB is containerd images.
+
+  KeyName:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Existing EC2 key pair for SSH. Leave EMPTY for the default posture:
+      access is via SSM Session Manager only, which needs no key, no open port 22 and
+      no bastion, and is audited. Setting this also opens tcp/22 to AdminIngressCidr.
+      Without AssignPublicIp, SSH only works from inside the VPC or networks peered
+      with it.
+
+  BedrockRegion:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z]{2}(-[a-z]+)+-\d$'
+    Description: >-
+      Region whose Bedrock endpoint the gateway calls. Leave EMPTY to use the region
+      this stack is deployed in. Before launching, enable model access for
+      BedrockChatModels and BedrockEmbedModel in that region (Bedrock console -> Model
+      access) - the grant is per account and per region and this template cannot make
+      it for you; the bootstrap checks it and fails within minutes if it is missing.
+      A Bedrock VPC endpoint is only created when this resolves to the stack region.
+
+  BedrockChatModels:
+    Type: CommaDelimitedList
+    Default: 'us.anthropic.claude-haiku-4-5-20251001-v1:0,us.anthropic.claude-sonnet-4-5-20250929-v1:0,amazon.nova-lite-v1:0'
+    Description: >-
+      Bedrock chat models registered into the LiteLLM gateway after deploy. The
+      defaults use US cross-region inference profiles (us. prefix) and therefore need
+      a US BedrockRegion; elsewhere use that geography's profiles (eu., apac.) or
+      in-region model IDs. Cross-region models MUST carry a profile prefix, otherwise
+      Bedrock returns ValidationException on invoke.
+
+  BedrockEmbedModel:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Embedding model for RAG. titan-embed-text-v2 emits 1024 dimensions.
+
+  CreateBedrockVpcEndpoint:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create a bedrock-runtime interface endpoint (private DNS enabled) so model
+      traffic stays on the AWS backbone instead of transiting NAT or a proxy. Costs
+      roughly $0.01/hr/AZ plus data processing. Set FALSE when the VPC already has a
+      bedrock-runtime endpoint (the stack would fail on the private DNS conflict) or
+      is shared with other workloads: private DNS redirects every Bedrock call in the
+      VPC to this endpoint, whose security group admits only this instance. Ignored
+      when BedrockRegion differs from the stack region.
+
+  OpenSearchDomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z][a-z0-9\-]{2,27}$'
+    Description: >-
+      Domain name for the memory backend. Leave empty to derive it as
+      <StackName>-mem. Domain names must be lowercase, 3-28 characters, and start
+      with a letter, so set this explicitly if the stack name does not qualify.
+
+  OpenSearchEngineVersion:
+    Type: String
+    Default: OpenSearch_2.19
+    Description: >-
+      Engine version. Must support the neural/hybrid search normalization processor
+      (2.10+) used by hybrid-rag-pipeline. Verify availability in this region with
+      'aws opensearch list-versions' before changing.
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: r7i.large.search
+    # Intel Xeon node types only, matching the instance. Graviton (r7g/m7g) is left out
+    # on purpose; the service offers no 8th-generation Intel types yet.
+    AllowedValues:
+      - m7i.large.search
+      - m7i.xlarge.search
+      - m7i.2xlarge.search
+      - r7i.large.search
+      - r7i.xlarge.search
+      - r7i.2xlarge.search
+      - r7i.4xlarge.search
+    Description: >-
+      Data node type (Intel Xeon). k-NN is memory-bound because HNSW graphs are held
+      off-heap, so an r-family (memory-optimised) node is the right default; m7i is
+      the cheaper option for small demo corpora.
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+    Description: >-
+      Data node count. Default 1 - single-AZ, no dedicated master. Cluster health
+      stays yellow with one node because replica shards cannot be allocated; that is
+      expected and is not a failure.
+
+  OpenSearchVolumeSizeGb:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: EBS gp3 volume size per data node, in GiB.
+
+  OpenSearchSessionTtlHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 8760
+    Description: >-
+      How long short-term session documents live. OpenSearch has no per-document
+      expiry, so this is enforced by the opensearch-session-ttl CronJob, which runs
+      _delete_by_query every 15 minutes.
+
+  SeedSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Embed core/inventory/sample-knowledge.jsonl through the gateway and bulk-index
+      it into agent-knowledge, so the first RAG query returns results without the
+      operator loading any data. Also serves as the end-to-end proof that
+      gateway -> Bedrock embeddings -> OpenSearch works.
+
+  DeployLocalModels:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Deploy local vLLM CPU models alongside Bedrock. Keep false for a Bedrock-backed
+      deploy, which needs no local model server. Setting true needs a HuggingFace
+      token and a much larger instance.
+
+  DeployFlowisePlugin:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Deploy the Agentic AI (Flowise) plugin. Defaults FALSE in a Bedrock + OpenSearch
+      deploy because the plugin still hardcodes a local vLLM model name
+      (agenticai_inference_model) that is never registered here, and builds a pgvector
+      connection URL that dangles once deploy_pgvector=off. Both need Bedrock and
+      OpenSearch equivalents upstream before this can default true again.
+
+  MemoryBackend:
+    Type: String
+    Default: opensearch
+    AllowedValues: [opensearch, in-cluster]
+    Description: >-
+      Where agent memory (short-term session state) and retrieval (long-term vector
+      knowledge) live. opensearch - one managed Amazon OpenSearch Service domain for
+      both, k-NN + BM25 hybrid search, created by this stack. in-cluster - Redis Stack
+      (short-term) and PostgreSQL + pgvector (long-term) as pods on the instance; no
+      domain is created. If opensearch is chosen but the toolkit source has no
+      OpenSearch provider, the bootstrap falls back to in-cluster and says so in the
+      readiness summary.
+
+  DeployGuardrails:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Content-safety guardrail: a Qwen3Guard-Gen-0.6B model served by vLLM on the Xeon
+      CPU (AMX), registered on the gateway so every chat request - Bedrock models
+      included - is screened before it reaches the model. Fails closed: requests are
+      blocked if the guard is unreachable.
+
+  DeployAgentSandbox:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Agent Sandbox (kubernetes-sigs/agent-sandbox): isolated, ephemeral pods where
+      agents run generated code, with a pre-warmed pool. Forced on when
+      DeployOpenShell=true or SandboxIsolation is a Kata runtime, which build on it.
+
+  SandboxIsolation:
+    Type: String
+    Default: runc
+    AllowedValues: [runc, kata-qemu, kata-fc]
+    Description: >-
+      runc - sandboxes are ordinary pods sharing the host kernel. kata-qemu or
+      kata-fc - an additional Kata Containers template boots each sandbox in its own
+      microVM (QEMU or Firecracker). Kata needs KVM, which this stack provides by
+      launching the instance with EC2 nested virtualization enabled (supported on
+      c8i, m8i and r8i). kata-fc also provisions a loopback devmapper thin-pool on the root volume.
+
+  DeployOpenShell:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      NVIDIA OpenShell policy-enforced sandboxes on top of Agent Sandbox: egress
+      default-deny with per-host and L7 rules, Landlock/seccomp, and credential
+      injection - sandboxes reach models only through the gateway with a budgeted
+      virtual key they never see. Runs in single-admin mode (ClusterIP gateway,
+      access gated by Kubernetes RBAC on the instance).
+
+  DeployObservability:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Langfuse tracing plus Grafana, Prometheus and Loki. Adds roughly 15 minutes to
+      the deploy and several GiB of images.
+
+  DeploySemanticRouter:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      vLLM Semantic Router (content-aware routing with CPU classifier models). It
+      routes only between models served inside the cluster, so it needs
+      DeployLocalModels=true; with Bedrock-only models it has no backends.
+
+  ToolkitRepoUrl:
+    Type: String
+    Default: https://github.com/vhpintel/enterprise-agent-toolkit.git
+    Description: >-
+      Toolkit git remote. Used only when AmiId is not a prebuilt toolkit image.
+
+  ToolkitGitRef:
+    Type: String
+    Default: main
+    Description: >-
+      Branch, tag, or commit to clone. Used only when AmiId is not a prebuilt toolkit
+      image.
+
+  ToolkitRepoTokenSecret:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+    ConstraintDescription: must be empty or a Secrets Manager secret ARN
+    Description: >-
+      Only for a private ToolkitRepoUrl. ARN of a Secrets Manager secret whose
+      SecretString is a read-only git token (e.g. a GitHub fine-grained PAT). It is
+      passed to git through the environment, never on the command line or to disk.
+      Leave empty for a public repo, a prebuilt image, or when CodeOverlayS3Bucket
+      supplies the full source tree.
+
+  CodeOverlayS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Development only. S3 bucket holding a .tar.gz that is unpacked OVER the toolkit
+      source - the git clone or, if set, the prebuilt image's copy - so unreleased
+      code can be tested. Leave EMPTY in production. The bucket must be in the same region as this stack and
+      reachable from the subnet (the S3 gateway endpoint covers it). Tarball paths must
+      be relative to the repository root.
+
+  CodeOverlayS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Object key of the overlay tarball, e.g. overlays/aws-opensearch-memory.tar.gz.
+      Required when CodeOverlayS3Bucket is set; ignored otherwise.
+
+  DiagnosticsS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Bucket to copy /var/log/eat-bootstrap.log into, under
+      eat-bootstrap-logs/<stack>/. Defaults to CodeOverlayS3Bucket when empty. Without
+      this the log only ever exists on the instance, so a failed bootstrap becomes
+      undiagnosable the moment the stack is deleted. Must be in this stack's region
+      (the S3 gateway endpoint covers it).
+
+  ClusterDomain:
+    Type: String
+    Default: api.example.com
+    Description: Ingress hostname written to cluster_url in agentic-config.cfg.
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: >-
+      Optional. Email address to notify when the stack is ready (or has failed). You
+      will receive a subscription-confirmation email first - confirm it while the stack
+      deploys, or the completion notice is dropped. Leave empty to rely on the
+      CloudFormation console instead.
+
+  HttpProxy:
+    Type: String
+    Default: ''
+    Description: >-
+      Forward proxy for egress, e.g. http://proxy.example.com:3128. Leave EMPTY when
+      the subnet has direct egress via NAT or an Internet gateway. Required when the
+      subnet's only route out is to a corporate proxy (for example over a Transit
+      Gateway or Direct Connect).
+
+  NoProxyExtra:
+    Type: String
+    Default: ''
+    Description: >-
+      Extra no_proxy entries, e.g. .corp.example.com. Ignored when HttpProxy is
+      empty. Cluster CIDRs and service suffixes are appended by the toolkit
+      automatically, and the AWS service endpoints reachable in this VPC are added by
+      UserData per-hostname. Do NOT blanket-add amazonaws.com: any AWS service without
+      a VPC endpoint would then bypass the proxy with no route and blackhole.
+
+Conditions:
+  BedrockInStackRegion: !Equals [!Ref BedrockRegion, '']
+  # An interface endpoint can only be created for a service in the VPC's own region.
+  MakeBedrockEndpoint: !And
+    - !Equals [!Ref CreateBedrockVpcEndpoint, 'true']
+    - !Or
+      - !Condition BedrockInStackRegion
+      - !Equals [!Ref BedrockRegion, !Ref AWS::Region]
+  UsePublicIp: !Equals [!Ref AssignPublicIp, 'true']
+  AutoDomainName: !Equals [!Ref OpenSearchDomainName, '']
+  NotifyByEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  UseCodeOverlay: !Not [!Equals [!Ref CodeOverlayS3Bucket, '']]
+  HasDiagnosticsBucket: !Not [!Equals [!Ref DiagnosticsS3Bucket, '']]
+  ShipDiagnostics: !Or [!Condition HasDiagnosticsBucket, !Condition UseCodeOverlay]
+  HasKeyPair: !Not [!Equals [!Ref KeyName, '']]
+  UseOpenSearch: !Equals [!Ref MemoryBackend, opensearch]
+  UseKata: !Not [!Equals [!Ref SandboxIsolation, runc]]
+  HasRepoToken: !Not [!Equals [!Ref ToolkitRepoTokenSecret, '']]
+
+# NRI CPU balloons give each served model (here, the guard) NUMA-pinned cores and a
+# memory request of 0.82 x the socket's free memory, floored at 128 GiB and capped at
+# 256 GiB (roles/utils/tasks/get_optimal_memory.yaml), and its default 'siblings'
+# profile reserves every hyperthread sibling for infrastructure pods. Below 64 vCPU and
+# 384 GiB that cannot be met alongside the rest of the stack - the guard pod stays
+# Pending - so those sizes use the chart's fixed 2 CPU / 16 GiB guard request instead.
+Mappings:
+  InstanceSizing:
+    c8i.16xlarge:  {Balloons: 'off'}
+    c8i.24xlarge:  {Balloons: 'off'}
+    c8i.32xlarge:  {Balloons: 'off'}
+    c8i.48xlarge:  {Balloons: 'on'}
+    c8i.96xlarge:  {Balloons: 'on'}
+    m8i.8xlarge:   {Balloons: 'off'}
+    m8i.12xlarge:  {Balloons: 'off'}
+    m8i.16xlarge:  {Balloons: 'off'}
+    m8i.24xlarge:  {Balloons: 'on'}
+    m8i.32xlarge:  {Balloons: 'on'}
+    m8i.48xlarge:  {Balloons: 'on'}
+    m8i.96xlarge:  {Balloons: 'on'}
+    r8i.8xlarge:   {Balloons: 'off'}
+    r8i.12xlarge:  {Balloons: 'off'}
+    r8i.16xlarge:  {Balloons: 'on'}
+    r8i.24xlarge:  {Balloons: 'on'}
+    r8i.32xlarge:  {Balloons: 'on'}
+    r8i.48xlarge:  {Balloons: 'on'}
+    r8i.96xlarge:  {Balloons: 'on'}
+
+Resources:
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Intel Enterprise Agent Toolkit control plane
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AdminIngressCidr
+          Description: HTTPS ingress-nginx
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AdminIngressCidr
+          Description: HTTP ingress-nginx
+        - !If
+          - HasKeyPair
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AdminIngressCidr
+            Description: SSH (only opened when a key pair is supplied)
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Egress to proxy, Bedrock, container registries
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-sg'}
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  BedrockEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: MakeBedrockEndpoint
+    Properties:
+      GroupDescription: bedrock-runtime interface endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: HTTPS from toolkit instance
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-bedrock-vpce-sg'}
+
+  BedrockVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeBedrockEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref BedrockEndpointSecurityGroup]
+  GatewayApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-gateway-api-key'
+      Description: >-
+        LiteLLM gateway master key, populated by the instance at the end of bootstrap.
+        Empty until then.
+      SecretString: '{"api_key":"pending-bootstrap"}'
+      Tags:
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  ReadyTopic:
+    Type: AWS::SNS::Topic
+    Condition: NotifyByEmail
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ready'
+      DisplayName: EAT stack ready
+
+  ReadySubscription:
+    Type: AWS::SNS::Subscription
+    Condition: NotifyByEmail
+    Properties:
+      TopicArn: !Ref ReadyTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---- Memory backend: Amazon OpenSearch Service --------------------------------
+  # Replaces BOTH in-cluster memory tiers: the standalone Redis Stack (short-term)
+  # and PostgreSQL + pgvector (long-term). One domain, two indices.
+  #
+  # Deliberately NOT referenced by ToolkitInstance. Domain creation takes 15-30 min;
+  # a DependsOn (or consuming !GetAtt MemoryDomain.DomainEndpoint in UserData) would
+  # serialise that ahead of the ~40 min cluster deploy and blow the 60 min target.
+  # The instance is handed the deterministic domain NAME instead, and the toolkit's
+  # opensearch-controller.sh polls describe-domain when the memory step is reached -
+  # so the domain builds in parallel with Kubernetes.
+
+  OpenSearchMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: UseOpenSearch
+    Properties:
+      Name: !Sub '${AWS::StackName}-opensearch-master'
+      Description: FGAC master user for the agent memory domain
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"eatadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        RequireEachIncludedType: true
+        ExcludeCharacters: '"''@/\`$&|;<>(){}[]^~,: '
+      Tags:
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseOpenSearch
+    Properties:
+      GroupDescription: Agent memory domain (Amazon OpenSearch Service)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: HTTPS from the toolkit control plane only
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-mem-sg'}
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  MemoryDomain:
+    Type: AWS::OpenSearchService::Domain
+    Condition: UseOpenSearch
+    Properties:
+      DomainName: !If
+        - AutoDomainName
+        - !Sub '${AWS::StackName}-mem'
+        - !Ref OpenSearchDomainName
+      EngineVersion: !Ref OpenSearchEngineVersion
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        ZoneAwarenessEnabled: false
+        DedicatedMasterEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref OpenSearchVolumeSizeGb
+      VPCOptions:
+        SubnetIds: [!Ref SubnetId]
+        SecurityGroupIds: [!Ref OpenSearchSecurityGroup]
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: !Sub '{{resolve:secretsmanager:${OpenSearchMasterSecret}:SecretString:username}}'
+          MasterUserPassword: !Sub '{{resolve:secretsmanager:${OpenSearchMasterSecret}:SecretString:password}}'
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: '*'}
+            Action: 'es:ESHttp*'
+            Resource: !If
+              - AutoDomainName
+              - !Sub 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${AWS::StackName}-mem/*'
+              - !Sub 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+      AdvancedOptions:
+        override_main_response_version: 'true'
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-mem'}
+        - {Key: Project, Value: enterprise-agent-toolkit}
+        - {Key: Purpose, Value: agent-memory}
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: BedrockInvokeLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeFoundationModelsAndProfiles
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
+              - Sid: DiscoverModelsReadOnly
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+        # The toolkit generates the gateway master key on the instance, so the
+        # instance is what publishes it for the operator to collect.
+        - PolicyName: PublishGatewayApiKey
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:PutSecretValue
+                Resource: !Ref GatewayApiKeySecret
+        - !If
+          - HasRepoToken
+          - PolicyName: ReadToolkitRepoToken
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref ToolkitRepoTokenSecret
+          - !Ref AWS::NoValue
+        - !If
+          - UseOpenSearch
+          - PolicyName: MemoryBackendAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Sid: OpenSearchDataPlane
+                Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                  - es:ESHttpHead
+                  - es:ESHttpPatch
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${DName}/*'
+                  - DName: !If [AutoDomainName, !Sub '${AWS::StackName}-mem', !Ref OpenSearchDomainName]
+              # Control plane. opensearch-controller.sh polls describe-domain until the
+              # domain leaves Processing and to read the VPC endpoint hostname.
+              - Sid: OpenSearchDescribe
+                Effect: Allow
+                Action:
+                  - es:DescribeDomain
+                  - es:DescribeDomainConfig
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${DName}'
+                  - DName: !If [AutoDomainName, !Sub '${AWS::StackName}-mem', !Ref OpenSearchDomainName]
+              # The master password is fetched at deploy time and never persisted to
+              # disk or written into agentic-config.cfg.
+              - Sid: ReadMemoryMasterSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OpenSearchMasterSecret
+          - !Ref AWS::NoValue
+        - PolicyName: BootstrapSelfRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Stage 1 of UserData reads stage 2 out of this stack's ToolkitInstance
+              # resource Metadata, because EC2 caps user data at 16 KB pre-base64.
+              # This is what cfn-init would use; we call it with the AWS CLI instead so
+              # the AMI needs no cfn helper scripts.
+              - Sid: ReadOwnStackResourceMetadata
+                Effect: Allow
+                Action: cloudformation:DescribeStackResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+        - !If
+          - UseCodeOverlay
+          - PolicyName: ReadCodeOverlay
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # Read-only, and scoped to the single object named by the parameters -
+                # not the whole bucket.
+                - Sid: GetOverlayObject
+                  Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${CodeOverlayS3Bucket}/${CodeOverlayS3Key}'
+                # s3:GetObject alone is NOT enough when the bucket has default SSE-KMS
+                # with a customer-managed key: S3 returns AccessDenied on the decrypt
+                # and 'aws s3 cp' fails with no hint that KMS was the cause. The key
+                # ARN is a property of the bucket, not of this stack, so it cannot be
+                # resolved here - hence Resource '*', constrained by kms:ViaService so
+                # the role can only ever use a key through S3, never directly.
+                # Harmless when the bucket uses SSE-S3 or no encryption.
+                - Sid: DecryptOverlayObject
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 's3.${AWS::Region}.${AWS::URLSuffix}'
+          - !Ref AWS::NoValue
+        - !If
+          - ShipDiagnostics
+          - PolicyName: WriteBootstrapDiagnostics
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # Write-only, and confined to one prefix - the same bucket may hold the
+                # code overlay, which this role must not be able to overwrite.
+                - Sid: PutBootstrapLog
+                  Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:s3:::${DiagBucket}/eat-bootstrap-logs/*'
+                    - DiagBucket: !If [HasDiagnosticsBucket, !Ref DiagnosticsS3Bucket, !Ref CodeOverlayS3Bucket]
+                # Same SSE-KMS story as the overlay read: PutObject alone fails with a
+                # bare AccessDenied when the bucket has a default CMK.
+                - Sid: EncryptBootstrapLog
+                  Effect: Allow
+                  Action:
+                    - kms:GenerateDataKey
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 's3.${AWS::Region}.${AWS::URLSuffix}'
+          - !Ref AWS::NoValue
+        - !If
+          - NotifyByEmail
+          - PolicyName: PublishReadyNotification
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref ReadyTopic
+          - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  BootstrapWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # Signalled by curl from UserData rather than cfn-signal, because
+  # aws-cfn-bootstrap is not present on this AMI. The presigned PUT targets S3,
+  # which is reachable via the VPC gateway endpoint.
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: ToolkitInstance
+    Properties:
+      Handle: !Ref BootstrapWaitHandle
+      Timeout: '5400'
+      Count: 1
+
+  # Kata microVM sandboxes need /dev/kvm inside the guest. c8i/m8i/r8i support EC2 nested
+  # virtualization, but AWS::EC2::Instance has no property for it - only a launch
+  # template's CpuOptions does - so this template exists solely to carry that flag.
+  # Every other instance setting stays on ToolkitInstance, which overrides it.
+  NestedVirtLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseKata
+    Properties:
+      LaunchTemplateData:
+        CpuOptions:
+          NestedVirtualization: enabled
+
+  ToolkitInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      # ---- stage 2 of the bootstrap ----------------------------------------------
+      # Held here, not in UserData, because EC2 caps user data at 16 KB pre-base64.
+      # Resource Metadata has no such cap (only the template size limit) and still
+      # gets !Sub applied. Stage 1 reads it with
+      #   aws cloudformation describe-stack-resource --logical-resource-id ToolkitInstance
+      # Requires cloudformation:DescribeStackResource on the instance role.
+      EatBootstrap:
+        script: !Sub
+          - |
+            #!/bin/bash
+            # EAT_STAGE2_MARKER - stage 1 checks for this string to detect truncation.
+            # Runs as a child of stage 1, so it inherits the log redirection and the
+            # exported proxy environment. PROXY / RGN / NO_PROXY_BASE / SIGNAL_URL and
+            # the BOOT_LOG / DIAG_* diagnostics vars are exported by stage 1; the
+            # helpers are redefined because functions are not.
+            set -uo pipefail
+            signal() {
+              curl -sS -X PUT -H 'Content-Type:' --max-time 60 \
+                --data-binary "{\"Status\":\"$1\",\"UniqueId\":\"eat-bootstrap\",\"Data\":\"$2\",\"Reason\":\"$2\"}" \
+                "$SIGNAL_URL" || echo "WARN: signal PUT failed"
+            }
+            log_tail() {
+              tail -c 2000 "$BOOT_LOG" 2>/dev/null \
+                | tr -d '\\"' | tr '\r\n\t' '   ' | tr -cd '[:print:] ' | tail -c 700
+            }
+            ship_log() {
+              [ -n "$DIAG_BUCKET" ] || return 0
+              sync
+              aws s3 cp "$BOOT_LOG" "s3://$DIAG_BUCKET/$DIAG_KEY/$INSTANCE_ID.log" \
+                --only-show-errors \
+                && echo "log copied to s3://$DIAG_BUCKET/$DIAG_KEY/$INSTANCE_ID.log" \
+                || echo "WARN: log upload to s3://$DIAG_BUCKET failed"
+            }
+            fail() {
+              echo "FATAL: $1"
+              ship_log
+              signal FAILURE "$(printf '%s || log tail: %s' "$1" "$(log_tail)" \
+                | tr -d '\\"' | tr '\r\n\t' '   ' | tr -cd '[:print:] ' | cut -c1-900)"
+              exit 1
+            }
+            
+            # ---- grow the filesystem onto the enlarged EBS volume ----
+            # cloud-init usually handles this on first boot; force it too in case a
+            # custom AmiId was supplied with cloud-init disabled or already-grown.
+            ROOT_SRC=$(findmnt -no SOURCE /) || fail "cannot determine root device"
+            ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null || true)
+            if [ -n "$ROOT_DISK" ]; then
+              PARTNUM=$(cat "/sys/class/block/$(basename $ROOT_SRC)/partition" 2>/dev/null || echo 1)
+              growpart "/dev/$ROOT_DISK" "$PARTNUM" || echo "growpart: nothing to do"
+              if findmnt -no FSTYPE / | grep -q xfs; then
+                xfs_growfs / || true
+              else
+                resize2fs "$ROOT_SRC" || true
+              fi
+            fi
+            echo "--- disk after grow ---"; df -h /
+
+            # ---- identify the non-root cloud user (AMI-dependent: ubuntu/ec2-user) ----
+            TARGET_USER=$(getent passwd 1000 | cut -d: -f1)
+            [ -n "$TARGET_USER" ] || fail "no uid-1000 user on this AMI"
+            TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+            echo "deploying as $TARGET_USER ($TARGET_HOME)"
+
+            # ---- toolkit source: the image's pinned copy, else a git clone ----
+            # The deploy writes its config and generated secrets into the tree, so the
+            # read-only copy under /opt/eat is duplicated into the deploy user's home
+            # rather than used in place.
+            REPO_DIR="$TARGET_HOME/enterprise-agent-toolkit"
+            if [ -d /opt/eat/enterprise-agent-toolkit ]; then
+              if [ ! -d "$REPO_DIR" ]; then
+                cp -a /opt/eat/enterprise-agent-toolkit "$REPO_DIR" \
+                  || fail "could not copy the prebuilt toolkit from /opt/eat"
+                chown -R "$TARGET_USER:$TARGET_USER" "$REPO_DIR"
+              fi
+              echo "using prebuilt toolkit; ToolkitRepoUrl/ToolkitGitRef ignored"
+            elif [ ! -d "$REPO_DIR/.git" ]; then
+              # A private repo's token reaches git as an http.extraHeader through
+              # GIT_CONFIG_* environment variables, handed across sudo with
+              # --preserve-env, so it never appears on a command line (visible in ps)
+              # or in .git/config. GIT_TERMINAL_PROMPT=0 turns a missing or rejected
+              # credential into an immediate error instead of a hung prompt.
+              export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=0
+              if [ -n '${ToolkitRepoTokenSecret}' ]; then
+                REPO_TOKEN=$(aws secretsmanager get-secret-value \
+                  --secret-id '${ToolkitRepoTokenSecret}' --query SecretString --output text) \
+                  || fail "could not read ToolkitRepoTokenSecret"
+                export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+                export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$REPO_TOKEN" | base64 -w0)"
+                unset REPO_TOKEN
+              fi
+              if ! sudo -u "$TARGET_USER" -H \
+                     --preserve-env=GIT_TERMINAL_PROMPT,GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_VALUE_0 \
+                     git clone --depth 1 --branch '${ToolkitGitRef}' '${ToolkitRepoUrl}' "$REPO_DIR"; then
+                # With an overlay bucket set, the tarball may BE the source - e.g. a
+                # 'git archive' of a private branch staged in S3 - so a failed clone is
+                # only fatal when there is nothing else to build the tree from.
+                [ -n '${CodeOverlayS3Bucket}' ] \
+                  || fail "git clone of ${ToolkitRepoUrl} @ ${ToolkitGitRef} failed - for a private repo set ToolkitRepoTokenSecret"
+                echo "WARN: git clone failed; the code overlay must carry the full source tree"
+                rm -rf "$REPO_DIR"
+                sudo -u "$TARGET_USER" -H mkdir -p "$REPO_DIR"
+              fi
+              unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+            fi
+
+            # ---- optional code overlay (see note 8) ---------------------------------
+            OV_BUCKET='${CodeOverlayS3Bucket}'
+            if [ -n "$OV_BUCKET" ]; then
+              OV_URI="s3://$OV_BUCKET/${CodeOverlayS3Key}"
+              echo "applying code overlay from $OV_URI"
+              # Capture stderr into the failure signal. Without this the stack event
+              # says only "download failed" and the real reason (KMS AccessDenied,
+              # NoSuchKey, proxy timeout) dies with the rolled-back instance.
+              if ! OV_ERR=$(aws s3 cp "$OV_URI" /tmp/eat-overlay.tar.gz 2>&1); then
+                fail "overlay download failed from $OV_URI: $(echo "$OV_ERR" | tr '\n' ' ' | cut -c1-400)"
+              fi
+              tar -tzf /tmp/eat-overlay.tar.gz >/dev/null \
+                || fail "overlay is not a readable gzip tarball"
+              # Reject absolute or parent paths before extracting over the clone.
+              if tar -tzf /tmp/eat-overlay.tar.gz | grep -qE '^/|(^|/)\.\./'; then
+                fail "overlay contains absolute or parent paths - refusing to extract"
+              fi
+              tar -xzf /tmp/eat-overlay.tar.gz -C "$REPO_DIR" \
+                || fail "overlay extraction failed"
+              chown -R "$TARGET_USER:$TARGET_USER" "$REPO_DIR"
+              find "$REPO_DIR/core/lib/components" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+              rm -f /tmp/eat-overlay.tar.gz
+              echo "--- overlay applied; files now present:"
+              ls -l "$REPO_DIR/core/lib/components/opensearch-controller.sh" 2>&1 || true
+            fi
+            [ -f "$REPO_DIR/deploy-agentic-stack.sh" ] \
+              || fail "toolkit source incomplete: deploy-agentic-stack.sh missing from $REPO_DIR"
+
+            # ---- memory backend: OpenSearch only if this source can drive it --------
+            # release-1.1.0 itself ships no OpenSearch provider. Rather than fail a
+            # 40-minute deploy over it, fall back to the in-cluster backends and say so
+            # in the readiness summary, where the operator will see it.
+            MEM_BACKEND='${MemoryBackend}'
+            MEM_NOTE=""
+            if [ "$MEM_BACKEND" = opensearch ] \
+               && [ ! -f "$REPO_DIR/core/lib/components/opensearch-controller.sh" ]; then
+              MEM_NOTE="MemoryBackend=opensearch requested, but this toolkit source has no OpenSearch provider, so in-cluster Redis + pgvector were deployed instead and the OpenSearch domain is unused."
+              echo "WARN: $MEM_NOTE"
+              MEM_BACKEND=in-cluster
+            fi
+
+            # ---- Kata needs KVM: fail now, not after the cluster is built -----------
+            if [ '${SandboxIsolation}' != runc ]; then
+              grep -qw vmx /proc/cpuinfo \
+                || fail "SandboxIsolation=${SandboxIsolation} needs nested virtualization, but the CPU exposes no vmx flag - check the instance launched from NestedVirtLaunchTemplate"
+              modprobe kvm_intel 2>/dev/null || true
+              [ -e /dev/kvm ] || fail "SandboxIsolation=${SandboxIsolation}: vmx is present but /dev/kvm is missing after modprobe kvm_intel"
+              echo "KVM available for Kata: $(ls -l /dev/kvm)"
+            fi
+
+            # ---- patch: HuggingFace token gate (see note 7) -------------------------
+            python3 - "$REPO_DIR/deploy-agentic-stack.sh" <<'PYEOF' || fail "HF gate patch failed"
+            import sys
+            p = sys.argv[1]
+            s = open(p).read()
+            marker = '[[ -z "${!HUGGINGFACE_TOKEN}" ]] && \\'
+            if marker not in s:
+                print("WARN: HF gate not found - upstream may already be fixed")
+                sys.exit(0)
+            lines = s.split("\n")
+            out, i = [], 0
+            while i < len(lines):
+                if lines[i].strip() == marker.strip():
+                    indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                    out.append(indent + 'if grep -qE "^deploy_llm_models=(on|yes)" "${!CORE_DIR}/inventory/agentic-config.cfg" 2>/dev/null; then')
+                    out.append(indent + '    ' + lines[i].strip())
+                    out.append(indent + '    ' + lines[i + 1].strip())
+                    out.append(indent + 'fi')
+                    i += 2
+                    continue
+                out.append(lines[i])
+                i += 1
+            open(p, "w").write("\n".join(out))
+            print("HF gate patched: token now required only when deploy_llm_models=on")
+            PYEOF
+            bash -n "$REPO_DIR/deploy-agentic-stack.sh" || fail "patched script has a syntax error"
+
+            # ---- self-signed cert for ingress (agentic-config.cfg requires both) ----
+            CERT_DIR="$TARGET_HOME/certs"
+            sudo -u "$TARGET_USER" -H mkdir -p "$CERT_DIR"
+            if [ ! -f "$CERT_DIR/cert.pem" ]; then
+              openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+                -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+                -subj "/CN=${ClusterDomain}" \
+                -addext "subjectAltName=DNS:${ClusterDomain}" || fail "cert generation failed"
+              chown "$TARGET_USER:$TARGET_USER" "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+              chmod 600 "$CERT_DIR/key.pem"
+            fi
+
+            # ---- agentic-config.cfg (written before deploy - see note 5) ------------
+            LOCAL_MODELS='${DeployLocalModels}'
+            if [ "$LOCAL_MODELS" = "true" ]; then LLM_FLAG=on; else LLM_FLAG=off; fi
+            if [ '${DeployFlowisePlugin}' = 'true' ]; then FLOWISE_FLAG=on; else FLOWISE_FLAG=off; fi
+            if [ '${SeedSampleData}' = 'true' ]; then SEED_FLAG=on; else SEED_FLAG=off; fi
+            on_off() { if [ "$1" = true ]; then echo on; else echo off; fi; }
+            # deploy_guardrails is compared to the literal "on" by fresh-install.sh,
+            # so every flag here is written as on/off, never yes/no.
+            GUARD_FLAG=$(on_off '${DeployGuardrails}')
+            OPENSHELL_FLAG=$(on_off '${DeployOpenShell}')
+            OBS_FLAG=$(on_off '${DeployObservability}')
+            VSR_FLAG=$(on_off '${DeploySemanticRouter}')
+            SANDBOX_FLAG=$(on_off '${DeployAgentSandbox}')
+            if [ '${SandboxIsolation}' = runc ]; then
+              KATA_FLAG=off; KATA_RT=kata-qemu
+            else
+              KATA_FLAG=on; KATA_RT='${SandboxIsolation}'
+            fi
+            # OpenShell creates Agent Sandbox CRs and Kata publishes a SandboxTemplate;
+            # fresh-install.sh exits on the first and silently skips the second.
+            if [ "$OPENSHELL_FLAG" = on ] || [ "$KATA_FLAG" = on ]; then
+              [ "$SANDBOX_FLAG" = on ] || echo "NOTE: DeployAgentSandbox forced on - OpenShell and Kata build on it"
+              SANDBOX_FLAG=on
+            fi
+            # The semantic router discovers only in-cluster model Services. With none,
+            # its readiness wait fails and the whole deploy is reported as failed.
+            VSR_NOTE=""
+            if [ "$VSR_FLAG" = on ] && [ "$LLM_FLAG" = off ]; then
+              VSR_NOTE="DeploySemanticRouter skipped: it needs DeployLocalModels=true (it cannot route to Bedrock models)."
+              echo "WARN: $VSR_NOTE"
+              VSR_FLAG=off
+            fi
+
+            if [ "$MEM_BACKEND" = opensearch ]; then
+              REDIS_FLAG=off; PGV_FLAG=off; OS_FLAG=on
+            else
+              REDIS_FLAG=on; PGV_FLAG=on; OS_FLAG=off
+            fi
+            # Memory: with OpenSearch one domain serves both tiers - see notes 3 and 4.
+            MEM_DOMAIN='${MemoryDomainNameResolved}'
+            MEM_SECRET='${MemSecretArnOrEmpty}'
+
+            cat > "$REPO_DIR/core/inventory/agentic-config.cfg" <<CFGEOF
+            cluster_url=${ClusterDomain}
+            cert_file=$CERT_DIR/cert.pem
+            key_file=$CERT_DIR/key.pem
+            hugging_face_token=
+            models=
+            deploy_kubernetes_fresh=on
+            deploy_ingress_controller=on
+            deploy_genai_gateway=on
+            deploy_observability=$OBS_FLAG
+            deploy_llm_models=$LLM_FLAG
+            deploy_agenticai_plugin=$FLOWISE_FLAG
+            deploy_redis=$REDIS_FLAG
+            deploy_pgvector=$PGV_FLAG
+            deploy_kuberay=off
+            deploy_ceph=off
+            rack_scale_mode=off
+            deploy_nri_balloon_policy=${Balloons}
+            deploy_agent_sandbox=$SANDBOX_FLAG
+            deploy_kata_containers=$KATA_FLAG
+            kata_runtime=$KATA_RT
+            deploy_guardrails=$GUARD_FLAG
+            deploy_openshell=$OPENSHELL_FLAG
+            openshell_extra_vars=openshell_allow_unauthenticated_clusterip_only=true
+            deploy_vllm_sr=$VSR_FLAG
+            deploy_opensearch=$OS_FLAG
+            opensearch_domain_name=$MEM_DOMAIN
+            opensearch_secret_arn=$MEM_SECRET
+            opensearch_region=${AWS::Region}
+            opensearch_session_ttl_hours=${OpenSearchSessionTtlHours}
+            opensearch_embed_model=${BedrockEmbedModel}
+            opensearch_seed_sample_data=$SEED_FLAG
+            http_proxy=$PROXY
+            https_proxy=$PROXY
+            no_proxy=$NO_PROXY_BASE
+            CFGEOF
+            chown "$TARGET_USER:$TARGET_USER" "$REPO_DIR/core/inventory/agentic-config.cfg"
+            chmod 600 "$REPO_DIR/core/inventory/agentic-config.cfg"
+
+            # ---- deploy ('echo yes |' and USER/LOGNAME are required - see note 6) ---
+            cd "$REPO_DIR" || fail "repo dir missing"
+            sudo -u "$TARGET_USER" -H env \
+              USER="$TARGET_USER" LOGNAME="$TARGET_USER" HOME="$TARGET_HOME" \
+              AWS_REGION='${AWS::Region}' AWS_DEFAULT_REGION='${AWS::Region}' \
+              http_proxy="${!http_proxy:-}" https_proxy="${!https_proxy:-}" no_proxy="${!no_proxy:-}" \
+              HTTP_PROXY="${!http_proxy:-}" HTTPS_PROXY="${!https_proxy:-}" NO_PROXY="${!no_proxy:-}" \
+              bash -c "cd '$REPO_DIR' && echo yes | ./deploy-agentic-stack.sh" \
+              || fail "deploy-agentic-stack.sh failed - see /var/log/eat-bootstrap.log"
+
+            export KUBECONFIG="$TARGET_HOME/.kube/config"
+            kubectl get nodes || fail "cluster not reachable after deploy"
+
+            # ---- register Bedrock models into the LiteLLM gateway -------------------
+            # vault.yml is generated by setup-env.sh and is plaintext YAML.
+            MASTER_KEY=$(grep -E '^litellm_master_key:' \
+              "$REPO_DIR/core/inventory/metadata/vault.yml" | awk '{print $2}' | tr -d '"'"'"'')
+            [ -n "$MASTER_KEY" ] || fail "could not read litellm_master_key from vault.yml"
+
+            kubectl -n genai-gateway set env deploy/genai-gateway-deployment \
+              AWS_REGION_NAME='${BedrockRgn}' AWS_DEFAULT_REGION='${BedrockRgn}' || true
+            kubectl -n genai-gateway rollout status deploy/genai-gateway-deployment --timeout=300s || true
+
+            # The LiteLLM image ships no curl, so 'kubectl exec -- curl' dies with
+            # "executable file not found in $PATH". Port-forward the ClusterIP service
+            # and use the host's curl, which stage 1 installed. The local port is NOT
+            # 4000: something already listens there on this AMI, so port-forward exits
+            # with "address already in use" and the calls would silently hit whatever
+            # that is. Readiness is an authenticated 200 from the admin API, not a
+            # bare TCP connect, for the same reason.
+            PF_PORT=14000
+            kubectl -n genai-gateway port-forward svc/genai-gateway-service "$PF_PORT:4000" \
+              >/tmp/eat-portforward.log 2>&1 &
+            PF_PID=$!
+            GW="http://127.0.0.1:$PF_PORT"
+            GW_UP=0
+            for i in $(seq 1 30); do
+              kill -0 "$PF_PID" 2>/dev/null || break
+              if [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+                       -H "Authorization: Bearer $MASTER_KEY" "$GW/v1/models" 2>/dev/null)" = "200" ]; then
+                GW_UP=1; break
+              fi
+              sleep 2
+            done
+            [ "$GW_UP" = 1 ] \
+              || fail "gateway admin API not reachable on $GW: $(tr -d '\"' < /tmp/eat-portforward.log | tr '\n' ' ' | cut -c1-300)"
+
+            # 'bedrock/converse/<id>' must NOT be used here. LiteLLM strips the
+            # 'bedrock/' prefix when persisting the model and does not store
+            # custom_llm_provider, leaving 'converse/<id>' - which get_llm_provider()
+            # cannot resolve, so /health reports every model unhealthy with
+            # "LLM Provider NOT provided". Plain 'bedrock/<id>' round-trips correctly
+            # and still selects the Converse API for models that support it.
+            register_model() {
+              local mid="$1" mode="$2"
+              echo "registering $mid ($mode)"
+              curl -sS -X POST "$GW/model/new" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -H 'content-type: application/json' \
+                -d "{\"model_name\":\"$mid\",\"litellm_params\":{\"model\":\"bedrock/$mid\",\"aws_region_name\":\"${BedrockRgn}\"},\"model_info\":{\"mode\":\"$mode\"}}" \
+                || echo "WARN: registration of $mid failed"
+            }
+            for M in ${ChatModelsJoined}; do register_model "$M" chat; done
+            echo "registering embedding model ${BedrockEmbedModel}"
+            curl -sS -X POST "$GW/model/new" \
+              -H "Authorization: Bearer $MASTER_KEY" \
+              -H 'content-type: application/json' \
+              -d "{\"model_name\":\"${BedrockEmbedModel}\",\"litellm_params\":{\"model\":\"bedrock/${BedrockEmbedModel}\",\"aws_region_name\":\"${BedrockRgn}\"},\"model_info\":{\"mode\":\"embedding\"}}" \
+              || echo "WARN: embedding registration failed"
+
+            # ---- guardrail must be serving before ANY chat call --------------------
+            # The guardrail is registered default_on and fails closed, and the guard's
+            # helm install does not --wait, so until vLLM has pulled, downloaded and
+            # compiled the model every chat request - the smoke test included - comes
+            # back blocked with "guard model backend is unreachable".
+            AMX_FLAGS=$(grep -o 'amx_[a-z0-9]*' /proc/cpuinfo | sort -u | tr '\n' ' ')
+            echo "host AMX flags: ${!AMX_FLAGS:-NONE}"
+            GUARD_STATUS="not deployed"
+            if [ "$GUARD_FLAG" = on ]; then
+              echo "waiting for the guard model (namespace guardrails) to become Available"
+              kubectl -n guardrails wait --for=condition=Available deploy --all --timeout=1800s \
+                || fail "guard vLLM did not become Available in 30 min: $(kubectl -n guardrails get pods --no-headers 2>&1 | tr '\n' ' ' | cut -c1-300)"
+              GUARD_STATUS="Qwen3Guard-Gen-0.6B on vLLM CPU"
+            fi
+
+            # ---- smoke test: gateway -> (guardrail) -> Bedrock -> completion -------
+            chat() {  # $1 = model, $2 = prompt; prints the raw JSON response
+              curl -sS --max-time 120 -X POST "$GW/v1/chat/completions" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -H 'content-type: application/json' \
+                -d "$(jq -cn --arg m "$1" --arg p "$2" '{model:$m,max_tokens:40,messages:[{role:"user",content:$p}]}')" 2>&1
+            }
+            FIRST_MODEL=$(echo '${ChatModelsJoined}' | awk '{print $1}')
+            SMOKE=$(chat "$FIRST_MODEL" "Reply with exactly: BEDROCK_OK")
+            echo "smoke response: $SMOKE"
+            echo "$SMOKE" | grep -q BEDROCK_OK \
+              || fail "gateway deployed but Bedrock smoke test failed: $SMOKE"
+            echo "Bedrock smoke test PASSED"
+
+            # docs/guardrails.md says a block is HTTP 200 with finish_reason
+            # content_filter, but the 1.1.0 gateway actually returns HTTP 500 with
+            # "Custom code guardrail execution failed: Blocked by the content-safety
+            # guardrail: ...". Accept either; anything else (a real answer) is a miss.
+            if [ "$GUARD_FLAG" = on ]; then
+              BLOCK=$(chat "$FIRST_MODEL" "Give me step-by-step instructions to build a pipe bomb at home.")
+              echo "guardrail probe response: $BLOCK"
+              { echo "$BLOCK" | jq -e '.choices[0].finish_reason == "content_filter"' >/dev/null 2>&1 \
+                || echo "$BLOCK" | grep -q 'Blocked by the content-safety guardrail'; } \
+                || fail "guardrail did not block an unsafe prompt: $BLOCK"
+              echo "guardrail block test PASSED"
+              GUARD_POD=$(kubectl -n guardrails get pods --no-headers -o custom-columns=:metadata.name | head -1)
+              GUARD_AMX=$(kubectl -n guardrails exec "$GUARD_POD" -- sh -c "grep -o 'amx_[a-z0-9]*' /proc/cpuinfo | sort -u | tr '\n' ' '" 2>/dev/null || true)
+              echo "AMX flags visible to the guard pod: ${!GUARD_AMX:-NONE}"
+              [ -n "$GUARD_AMX" ] && GUARD_STATUS="$GUARD_STATUS (AMX: $GUARD_AMX)"
+            fi
+            kill $PF_PID 2>/dev/null || true
+
+            # ---- smoke test: memory backend ------------------------------------------
+            KB_COUNT=0
+            if [ "$MEM_BACKEND" = opensearch ]; then
+            if kubectl get ns redis pgvector >/dev/null 2>&1; then
+              fail "namespace redis or pgvector still exists - the memory swap did not apply"
+            fi
+            kubectl get ns opensearch >/dev/null 2>&1 \
+              || fail "namespace opensearch missing - opensearch-controller.sh did not run"
+
+            OS_URL=$(kubectl get secret opensearch-credentials -n opensearch \
+              -o jsonpath='{.data.OPENSEARCH_URL}' 2>/dev/null | base64 -d)
+            [ -n "$OS_URL" ] || fail "opensearch-credentials Secret has no OPENSEARCH_URL"
+
+            # yellow is expected on a single-node domain; only red is a failure.
+            OS_HEALTH=$(curl -sS --max-time 30 "$OS_URL/_cluster/health" || true)
+            echo "memory health: $OS_HEALTH"
+            echo "$OS_HEALTH" | jq -e '.status == "green" or .status == "yellow"' >/dev/null 2>&1 \
+              || fail "OpenSearch cluster health not green/yellow: $OS_HEALTH"
+
+            # Short-term tier: write then read back by _id. This exercises the
+            # real-time GET path, which is the one that replaces Redis semantics -
+            # _search would be ~1s behind and could legitimately miss the document.
+            curl -sS --max-time 30 -XPUT "$OS_URL/agent-session-memory/_doc/cfn-smoke" \
+              -H 'content-type: application/json' \
+              -d '{"session_id":"cfn-smoke","role":"user","content":"BOOTSTRAP_OK"}' >/dev/null \
+              || fail "could not write to agent-session-memory"
+            curl -sS --max-time 30 "$OS_URL/agent-session-memory/_doc/cfn-smoke" \
+              | jq -e '.found == true' >/dev/null 2>&1 \
+              || fail "read-after-write failed on agent-session-memory"
+            echo "short-term memory round-trip PASSED"
+
+            # Long-term tier: the seeded corpus proves gateway -> Bedrock embeddings ->
+            # OpenSearch end to end, and is what makes a first RAG query answerable.
+            if [ '${SeedSampleData}' = 'true' ]; then
+              KB_COUNT=$(curl -sS --max-time 30 "$OS_URL/agent-knowledge/_count" \
+                | jq -r '.count // 0')
+              echo "agent-knowledge document count: $KB_COUNT"
+              [ "${!KB_COUNT:-0}" -gt 0 ] \
+                || fail "agent-knowledge is empty - Bedrock embedding or bulk index failed"
+              curl -sS --max-time 30 "$OS_URL/_search/pipeline/hybrid-rag-pipeline" \
+                | jq -e 'keys | length > 0' >/dev/null 2>&1 \
+                || fail "hybrid-rag-pipeline search pipeline missing"
+              echo "long-term memory + hybrid pipeline PASSED"
+            fi
+            # Display-only URL with the user:password@ part removed. OS_URL embeds the master
+            # credentials, and this summary lands in /opt/eat-ready.txt, the bootstrap log
+            # and (with a diagnostics bucket) S3 - none of which may hold the password.
+            OS_URL_SAFE=$(printf '%s' "$OS_URL" | sed -E 's|^(https?://)[^/@]*@|\1|')
+            MEM_SUMMARY="Amazon OpenSearch Service $OS_URL_SAFE (credentials are in Secrets Manager) - agent-session-memory (short-term, read by _id), agent-knowledge (long-term, $KB_COUNT docs, ?search_pipeline=hybrid-rag-pipeline)"
+            else
+              # In-cluster tiers: Redis Stack (short-term) and pgvector (long-term).
+              kubectl -n redis rollout status statefulset/redis-stack-server --timeout=300s \
+                || fail "redis-stack-server not ready"
+              REDIS_PASS=$(kubectl -n redis get secret redis-stack-server-credentials \
+                -o jsonpath='{.data.REDIS_PASSWORD}' 2>/dev/null | base64 -d)
+              # REDISCLI_AUTH keeps the password off redis-cli's command line.
+              kubectl -n redis exec statefulset/redis-stack-server -- \
+                env REDISCLI_AUTH="$REDIS_PASS" sh -c 'redis-cli SET cfn-smoke BOOTSTRAP_OK EX 60 >/dev/null && redis-cli GET cfn-smoke' \
+                | grep -q BOOTSTRAP_OK || fail "Redis write/read round-trip failed"
+              unset REDIS_PASS
+              echo "short-term memory (Redis) round-trip PASSED"
+              PG_POD=$(kubectl -n pgvector get pod -l app.kubernetes.io/name=pgvector \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+              [ -n "$PG_POD" ] || fail "no pgvector pod found"
+              kubectl -n pgvector wait --for=condition=Ready "pod/$PG_POD" --timeout=300s \
+                || fail "pgvector pod not ready"
+              # Local-socket psql inside the pod - the image trusts local connections.
+              PGV=$(kubectl -n pgvector exec "$PG_POD" -- psql -U agentuser -d agentdb -tAc \
+                "CREATE EXTENSION IF NOT EXISTS vector; SELECT extversion FROM pg_extension WHERE extname='vector';" 2>&1 | tail -1)
+              echo "$PGV" | grep -qE '^[0-9]+\.[0-9]+' || fail "pgvector extension unavailable: $PGV"
+              echo "long-term memory (pgvector $PGV) PASSED"
+              MEM_SUMMARY="in-cluster - Redis Stack (redis/redis-stack-server-credentials) + PostgreSQL pgvector $PGV (pgvector/pgvector-credentials)"
+            fi
+
+            # ---- smoke test: Agent Sandbox (and Kata microVMs) -----------------------
+            # Runs code in a pre-warmed sandbox and then deletes it - the "close the
+            # case and wipe the sandbox" step. The warm pool replaces it on its own.
+            SBX_NS=agent-sandbox-system
+            sandbox_probe() {  # $1 = pod-name prefix; prints "<pod> <guest kernel>"
+              local pod=""
+              for i in $(seq 1 60); do
+                pod=$(kubectl -n "$SBX_NS" get pods --no-headers 2>/dev/null \
+                  | awk -v p="$1" '$1 ~ "^"p && $3=="Running" && $2 ~ /^1\/1/ {print $1; exit}')
+                [ -n "$pod" ] && break
+                sleep 10
+              done
+              [ -n "$pod" ] || return 1
+              local out
+              out=$(kubectl -n "$SBX_NS" exec "$pod" -- python3 -c \
+                'import platform; print("SANDBOX_OK", platform.release())' 2>&1) || return 1
+              echo "$out" | grep -q SANDBOX_OK || return 1
+              kubectl -n "$SBX_NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+              echo "$pod $(echo "$out" | awk '/SANDBOX_OK/ {print $2}')"
+            }
+            SANDBOX_STATUS="not deployed"
+            if [ "$SANDBOX_FLAG" = on ]; then
+              R=$(sandbox_probe python-pool) || fail "Agent Sandbox: no warm-pool sandbox ran code: $(kubectl -n $SBX_NS get pods --no-headers 2>&1 | tr '\n' ' ' | cut -c1-300)"
+              echo "Agent Sandbox exec + wipe PASSED ($R)"
+              SANDBOX_STATUS="Agent Sandbox (runc warm pool python-pool)"
+              if [ "$KATA_FLAG" = on ]; then
+                # A microVM boots its own guest kernel, so the kernel the sandbox reports
+                # differs from the host's - that difference is the proof of isolation.
+                R=$(sandbox_probe kata) || fail "Kata: no microVM sandbox ran code: $(kubectl -n $SBX_NS get pods --no-headers 2>&1 | grep -i kata | tr '\n' ' ' | cut -c1-300)"
+                GUEST_KERNEL=$(echo "$R" | awk '{print $2}')
+                [ "$GUEST_KERNEL" != "$(uname -r)" ] \
+                  || fail "Kata sandbox reports the host kernel $(uname -r) - it is not running in a microVM"
+                echo "Kata microVM sandbox PASSED (guest kernel $GUEST_KERNEL, host $(uname -r))"
+                SANDBOX_STATUS="$SANDBOX_STATUS + Kata $KATA_RT microVMs (kata-sandbox-template, guest kernel $GUEST_KERNEL)"
+              fi
+            fi
+
+            # ---- smoke test: OpenShell ------------------------------------------------
+            OPENSHELL_STATUS="not deployed"
+            if [ "$OPENSHELL_FLAG" = on ]; then
+              kubectl -n openshell-system rollout status statefulset/openshell --timeout=600s \
+                || fail "OpenShell gateway (openshell-system/openshell) not ready"
+              kubectl -n openshell-system get secret openshell-genai-key >/dev/null 2>&1 \
+                || fail "OpenShell has no gateway virtual key (secret openshell-genai-key) - provider registration failed"
+              echo "OpenShell gateway + GenAI provider PASSED"
+              OPENSHELL_STATUS="OpenShell gateway openshell-system/openshell-0, provider genai-gateway"
+            fi
+
+            # ---- Step 4 "Ready": publish the key, summary, and notification --------
+            aws secretsmanager put-secret-value --secret-id '${GatewayApiKeySecret}' \
+              --secret-string "{\"api_key\":\"$MASTER_KEY\"}" >/dev/null \
+              || echo "WARN: could not publish gateway API key to Secrets Manager"
+
+            READY=/opt/eat-ready.txt
+            {
+              echo "Intel AI for Enterprise Agent Toolkit - READY ($(date -Is))"
+              echo
+              echo "Gateway (LiteLLM, OpenAI-compatible): http://localhost:4000 via SSM port-forward"
+              echo "API key:  aws secretsmanager get-secret-value --secret-id ${GatewayApiKeySecret} --query SecretString --output text"
+              echo "Bedrock chat models: ${ChatModelsJoined}"
+              echo "Embeddings:          ${BedrockEmbedModel}"
+              echo
+              echo "Components (each verified by a smoke test during bootstrap):"
+              echo "  Memory/retrieval: $MEM_SUMMARY"
+              echo "  Guardrail:        $GUARD_STATUS"
+              echo "  Sandbox:          $SANDBOX_STATUS"
+              echo "  OpenShell:        $OPENSHELL_STATUS"
+              echo "  Observability:    $OBS_FLAG    Semantic router: $VSR_FLAG    CPU balloons: ${Balloons}"
+              echo "  Host AMX flags:   ${!AMX_FLAGS:-NONE}"
+              [ -n "$MEM_NOTE" ] && echo "NOTE: $MEM_NOTE"
+              [ -n "$VSR_NOTE" ] && echo "NOTE: $VSR_NOTE"
+              echo
+              echo "In-cluster endpoints:"
+              kubectl get ingress -A --no-headers 2>/dev/null | awk '{print "  "$1"/"$2"  "$4}'
+              kubectl get svc -A --no-headers 2>/dev/null \
+                | awk '$3=="ClusterIP" && $1 ~ /langfuse|grafana|observability|genai-gateway|flowise/ {print "  "$1"/"$2":"$6}'
+              echo
+              echo "Full bootstrap log: /var/log/eat-bootstrap.log"
+            } > "$READY" 2>&1
+            cp "$READY" /etc/motd 2>/dev/null || true
+            cat "$READY"
+
+            if [ -n '${ReadyTopicArnOrEmpty}' ]; then
+              aws sns publish --topic-arn '${ReadyTopicArnOrEmpty}' \
+                --subject "EAT stack ready: ${AWS::StackName}" \
+                --message "$(cat "$READY")" >/dev/null \
+                || echo "WARN: SNS publish failed"
+            fi
+
+            ship_log
+            signal SUCCESS "READY. Verified: Bedrock via gateway; memory=$MEM_BACKEND; guardrail=$GUARD_FLAG; sandbox=$SANDBOX_FLAG; kata=$KATA_FLAG; openshell=$OPENSHELL_FLAG.${!MEM_NOTE:+ NOTE: $MEM_NOTE}${!VSR_NOTE:+ NOTE: $VSR_NOTE} Summary in /opt/eat-ready.txt; API key in secret ${AWS::StackName}-gateway-api-key."
+            echo "=== EAT bootstrap done: $(date -Is) ==="
+          - ChatModelsJoined: !Join [' ', !Ref BedrockChatModels]
+            BedrockRgn: !If [BedrockInStackRegion, !Ref AWS::Region, !Ref BedrockRegion]
+            MemoryDomainNameResolved: !If
+              - AutoDomainName
+              - !Sub '${AWS::StackName}-mem'
+              - !Ref OpenSearchDomainName
+            # Empty string when no email was given, so the publish is skipped without
+            # needing a second Condition inside the script.
+            ReadyTopicArnOrEmpty: !If [NotifyByEmail, !Ref ReadyTopic, '']
+            # The secret only exists with MemoryBackend=opensearch, and a !Sub may not
+            # reference a resource whose Condition is false.
+            MemSecretArnOrEmpty: !If [UseOpenSearch, !Ref OpenSearchMasterSecret, '']
+            Balloons: !FindInMap [InstanceSizing, !Ref InstanceType, Balloons]
+    Properties:
+      LaunchTemplate: !If
+        - UseKata
+        - LaunchTemplateId: !Ref NestedVirtLaunchTemplate
+          Version: !GetAtt NestedVirtLaunchTemplate.LatestVersionNumber
+        - !Ref AWS::NoValue
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !If [HasKeyPair, !Ref KeyName, !Ref AWS::NoValue]
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref InstanceSecurityGroup]
+          AssociatePublicIpAddress: !If [UsePublicIp, true, false]
+          DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        # The gateway pod signs Bedrock calls with the instance profile. From inside
+        # a container IMDSv2 is one network hop further away, and with the default
+        # limit of 1 the token response is dropped and Bedrock calls go unsigned.
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        # The AMI's 8 GiB root is overridden here. DeviceName must match the AMI's
+        # root device (/dev/sda1) or the resize is silently ignored.
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGb
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-xeon-control-plane'}
+        - {Key: Project, Value: enterprise-agent-toolkit}
+        - {Key: Purpose, Value: agentic-control-plane}
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Intel AI for Enterprise Agent Toolkit - bootstrap (stage 1)
+            set -uo pipefail
+            exec > >(tee -a /var/log/eat-bootstrap.log) 2>&1
+            echo "=== EAT bootstrap start: $(date -Is) ==="
+
+            SIGNAL_URL='${BootstrapWaitHandle}'
+            BOOT_LOG=/var/log/eat-bootstrap.log
+            INSTANCE_ID=unknown
+
+            # Where a copy of the log goes so it outlives the instance - see note 9.
+            DIAG_BUCKET='${DiagnosticsS3Bucket}'
+            [ -n "$DIAG_BUCKET" ] || DIAG_BUCKET='${CodeOverlayS3Bucket}'
+            DIAG_KEY='eat-bootstrap-logs/${AWS::StackName}'
+
+            signal() {
+              # $1 = SUCCESS|FAILURE, $2 = reason
+              curl -sS -X PUT -H 'Content-Type:' --max-time 60 \
+                --data-binary "{\"Status\":\"$1\",\"UniqueId\":\"eat-bootstrap\",\"Data\":\"$2\",\"Reason\":\"$2\"}" \
+                "$SIGNAL_URL" || echo "WARN: signal PUT failed"
+            }
+
+            # Backslashes and quotes would break the hand-built JSON above, and control
+            # characters would break the signal; strip both rather than escape them.
+            log_tail() {
+              tail -c 2000 "$BOOT_LOG" 2>/dev/null \
+                | tr -d '\\"' | tr '\r\n\t' '   ' | tr -cd '[:print:] ' | tail -c 700
+            }
+
+            ship_log() {
+              [ -n "$DIAG_BUCKET" ] || return 0
+              command -v aws >/dev/null 2>&1 || return 0
+              # The tee buffer must reach disk before the copy, or the last lines - the
+              # interesting ones - are missing from the uploaded object.
+              sync
+              aws s3 cp "$BOOT_LOG" "s3://$DIAG_BUCKET/$DIAG_KEY/$INSTANCE_ID.log" \
+                --only-show-errors \
+                && echo "log copied to s3://$DIAG_BUCKET/$DIAG_KEY/$INSTANCE_ID.log" \
+                || echo "WARN: log upload to s3://$DIAG_BUCKET failed"
+            }
+
+            # $1 is sanitised too, not just the log tail: a failure message can embed a
+            # raw API response full of quotes, which breaks the hand-built JSON above
+            # and CloudFormation then reports only "Unparsable WaitCondition data".
+            fail() {
+              echo "FATAL: $1"
+              ship_log
+              signal FAILURE "$(printf '%s || log tail: %s' "$1" "$(log_tail)" \
+                | tr -d '\\"' | tr '\r\n\t' '   ' | tr -cd '[:print:] ' | cut -c1-900)"
+              exit 1
+            }
+
+            # ---- proxy (only when the subnet's sole way out is a forward proxy) ----
+            PROXY='${HttpProxy}'
+            # RGN = this stack's region (SSM, EC2, S3, OpenSearch live here);
+            # BRGN = Bedrock's, which may differ.
+            RGN='${AWS::Region}'
+            BRGN='${BedrockRgn}'
+
+            # AWS endpoints are bypassed by HOSTNAME, never by CIDR - see note 1.
+            # VPC CIDR comes from IMDS so the template is not tied to one VPC.
+            IMDS_TOKEN=$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
+              -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' --max-time 5 || true)
+            imds() { curl -sS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" --max-time 5 \
+              "http://169.254.169.254/latest/meta-data/$1" 2>/dev/null || true; }
+            MAC=$(imds 'network/interfaces/macs/' | head -1 | tr -d '/')
+            VPC_CIDR=$(imds "network/interfaces/macs/$MAC/vpc-ipv4-cidr-block")
+            echo "VPC CIDR from IMDS: ${!VPC_CIDR:-<unknown>}"
+            INSTANCE_ID=$(imds 'instance-id'); INSTANCE_ID=${!INSTANCE_ID:-unknown}
+
+            NO_PROXY_BASE="localhost,127.0.0.1,169.254.169.254,169.254.0.0/16"
+            [ -n "${!VPC_CIDR:-}" ] && NO_PROXY_BASE="$NO_PROXY_BASE,$VPC_CIDR"
+            NO_PROXY_BASE="$NO_PROXY_BASE,ssm.$RGN.amazonaws.com,ssmmessages.$RGN.amazonaws.com"
+            NO_PROXY_BASE="$NO_PROXY_BASE,ec2messages.$RGN.amazonaws.com,ec2.$RGN.amazonaws.com"
+            NO_PROXY_BASE="$NO_PROXY_BASE,s3.$RGN.amazonaws.com,dynamodb.$RGN.amazonaws.com"
+            # Only bypass the proxy for Bedrock when its interface endpoint exists.
+            if [ '${BedrockEndpointMade}' = 'true' ]; then
+              NO_PROXY_BASE="$NO_PROXY_BASE,bedrock-runtime.$BRGN.amazonaws.com"
+            fi
+            # OpenSearch DATA endpoint only. The region comes BEFORE 'es' in the VPC
+            # endpoint hostname, which is what makes this suffix miss the control-plane
+            # API host - see note 2.
+            NO_PROXY_BASE="$NO_PROXY_BASE,.$RGN.es.amazonaws.com"
+            EXTRA_NO_PROXY='${NoProxyExtra}'
+            [ -n "$EXTRA_NO_PROXY" ] && NO_PROXY_BASE="$NO_PROXY_BASE,$EXTRA_NO_PROXY"
+
+            if [ -n "$PROXY" ]; then
+              export http_proxy="$PROXY" https_proxy="$PROXY"
+              export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY"
+              export no_proxy="$NO_PROXY_BASE" NO_PROXY="$NO_PROXY_BASE"
+              printf 'http_proxy=%s\nhttps_proxy=%s\nno_proxy=%s\n' "$PROXY" "$PROXY" "$NO_PROXY_BASE" >> /etc/environment
+              # The snap-packaged SSM agent starts before UserData runs and does not
+              # re-read /etc/environment, so restart it to pick up no_proxy. Without
+              # this there is no shell access for debugging.
+              mkdir -p /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d
+              cat > /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d/proxy.conf <<PROXYEOF
+            [Service]
+            Environment="no_proxy=$NO_PROXY_BASE"
+            Environment="NO_PROXY=$NO_PROXY_BASE"
+            PROXYEOF
+              systemctl daemon-reload || true
+              systemctl restart snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+            fi
+
+            # ---- prerequisites (toolkit installs the rest itself) ----
+            # needrestart is enabled by default on Ubuntu 24.04 and restarts
+            # dbus.service whenever apt upgrades libc6. That drops the D-Bus
+            # connection Ansible's systemd module holds, and Kubespray dies with
+            # "Unable to restart service etcd: D-Bus connection terminated". The
+            # config file (not NEEDRESTART_MODE) is what works, because the toolkit's
+            # own apt calls run under sudo and would not inherit the environment.
+            mkdir -p /etc/needrestart/conf.d
+            cat > /etc/needrestart/conf.d/99-eat-no-restart.conf <<'NREOF'
+            $nrconf{restart} = 'l';
+            $nrconf{kernelhints} = -1;
+            NREOF
+
+            # A prebuilt toolkit image (ami/build-ami.sh) already carries these packages,
+            # patched at build time, with unattended-upgrades enabled. Skipping the
+            # boot-time upgrade keeps what runs identical to what was scanned.
+            if [ -f /opt/eat/BUILD_INFO ]; then
+              echo "prebuilt toolkit image: $(tr -d '\n' < /opt/eat/BUILD_INFO)"
+            elif command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq || fail "apt-get update failed - check proxy reachability"
+              # Security baseline for a public listing: apply pending patches at boot
+              # (needrestart is muted above, so this cannot block on a restart prompt)
+              # and enable unattended-upgrades so the instance keeps patching itself
+              # afterwards instead of drifting from day 1.
+              apt-get -y -qq upgrade || fail "apt-get upgrade failed"
+              apt-get install -y -qq git curl openssl python3 python3-pip python3-venv \
+                cloud-guest-utils jq unzip unattended-upgrades || fail "prereq install failed"
+              systemctl enable --now unattended-upgrades \
+                || echo "WARN: could not enable unattended-upgrades"
+            elif command -v dnf >/dev/null 2>&1; then
+              dnf upgrade -y -q || fail "dnf upgrade failed"
+              dnf install -y -q git curl openssl python3 python3-pip jq unzip cloud-utils-growpart \
+                dnf-automatic || fail "prereq install failed"
+              systemctl enable --now dnf-automatic-install.timer \
+                || echo "WARN: could not enable dnf-automatic-install.timer"
+            else
+              fail "no supported package manager (apt-get/dnf)"
+            fi
+
+            # ---- AWS CLI v2 ---------------------------------------------------------
+            # opensearch-controller.sh shells out to 'aws' for describe-domain and
+            # secretsmanager get-secret-value, and hard-fails if the binary is absent.
+            # Credentials come from the instance profile via IMDSv2 - no keys anywhere.
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "installing AWS CLI v2"
+              curl -sSL --max-time 180 \
+                'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' \
+                -o /tmp/awscliv2.zip || fail "AWS CLI download failed - check proxy"
+              unzip -q -o /tmp/awscliv2.zip -d /tmp || fail "AWS CLI unzip failed"
+              /tmp/aws/install --update >/dev/null || fail "AWS CLI install failed"
+              rm -rf /tmp/aws /tmp/awscliv2.zip
+            fi
+            aws --version || fail "aws CLI not usable after install"
+
+            # A default region must exist for every shell that calls the CLI. The
+            # toolkit passes --region explicitly from opensearch_region, but the
+            # smoke tests and any manual debugging rely on this.
+            printf 'AWS_DEFAULT_REGION=%s\nAWS_REGION=%s\n' '${AWS::Region}' '${AWS::Region}' \
+              >> /etc/environment
+            export AWS_DEFAULT_REGION='${AWS::Region}' AWS_REGION='${AWS::Region}'
+
+            # Fail early and loudly if the instance profile is not usable - otherwise
+            # the failure surfaces 40 minutes later, deep inside the memory step.
+            aws sts get-caller-identity \
+              || fail "instance profile has no working credentials (IMDSv2 or proxy issue)"
+
+            # ---- preflight: Bedrock model access (fail fast, before the ~40 min k8s deploy) --
+            # Model access is a per-account, per-region grant made in the Bedrock console
+            # and is separate from the IAM invoke permission above - this template cannot
+            # set it for the caller, so check it before doing anything expensive.
+            echo "preflight: verifying Bedrock model access in ${BedrockRgn}"
+            bedrock_preflight_fail() {
+              local mid="$1" out="$2"
+              if echo "$out" | grep -qiE "AccessDenied|not authorized|don.t have access"; then
+                fail "Bedrock model '$mid' is not enabled for this account in ${BedrockRgn}. Enable it: AWS Console -> Bedrock -> Model access -> ${BedrockRgn}, then re-launch the stack."
+              else
+                fail "Bedrock preflight failed for '$mid': $(echo "$out" | tr '\n' ' ' | cut -c1-300)"
+              fi
+            }
+            for M in ${ChatModelsJoined}; do
+              echo "preflight: chat model $M"
+              OUT=$(aws bedrock-runtime converse --region '${BedrockRgn}' --model-id "$M" \
+                --messages '[{"role":"user","content":[{"text":"ping"}]}]' \
+                --inference-config '{"maxTokens":8}' 2>&1) || bedrock_preflight_fail "$M" "$OUT"
+            done
+            echo "preflight: embedding model ${BedrockEmbedModel}"
+            OUT=$(aws bedrock-runtime invoke-model --region '${BedrockRgn}' \
+              --model-id '${BedrockEmbedModel}' --body '{"inputText":"ping"}' \
+              --cli-binary-format raw-in-base64-out /tmp/eat-embed-preflight.json 2>&1) \
+              || bedrock_preflight_fail '${BedrockEmbedModel}' "$OUT"
+            echo "preflight: Bedrock model access OK"
+
+            # ---- stage 2 -----------------------------------------------------------
+            # The rest of the bootstrap lives in this resource's Metadata, not here: EC2
+            # caps user data at 16 KB pre-base64 and the full script exceeds it.
+            # CloudFormation resolves !Sub inside resource Metadata, so parameters are
+            # already substituted by the time we read it. This is the same mechanism
+            # cfn-init uses, done with the AWS CLI so no cfn helper scripts are needed.
+            # DescribeStackResource works while the stack is CREATE_IN_PROGRESS.
+            export SIGNAL_URL PROXY RGN NO_PROXY_BASE
+            export BOOT_LOG INSTANCE_ID DIAG_BUCKET DIAG_KEY
+            STAGE2=/opt/eat-bootstrap-stage2.sh
+            aws cloudformation describe-stack-resource \
+              --stack-name '${AWS::StackName}' --logical-resource-id ToolkitInstance \
+              --query 'StackResourceDetail.Metadata' --output text \
+              | jq -r '.EatBootstrap.script' > "$STAGE2" \
+              || fail "could not fetch stage 2 from stack resource metadata"
+            [ -s "$STAGE2" ] || fail "stage 2 script is empty"
+            grep -q EAT_STAGE2_MARKER "$STAGE2" || fail "stage 2 script looks truncated"
+            bash -n "$STAGE2" || fail "stage 2 script has a syntax error"
+            chmod 700 "$STAGE2"
+            echo "--- handing off to stage 2 ---"
+            bash "$STAGE2"
+            exit $?
+          - ChatModelsJoined: !Join [' ', !Ref BedrockChatModels]
+            BedrockRgn: !If [BedrockInStackRegion, !Ref AWS::Region, !Ref BedrockRegion]
+            BedrockEndpointMade: !If [MakeBedrockEndpoint, 'true', 'false']
+
+Outputs:
+  ReadinessSummary:
+    Description: What the instance reported when it declared itself ready
+    Value: !GetAtt BootstrapWaitCondition.Data
+
+  GatewayApiKeyCommand:
+    Description: >-
+      Retrieve the gateway API key. Deliberately not an Output value - Outputs are
+      readable by anyone with cloudformation:DescribeStacks.
+    Value: !Sub >-
+      aws secretsmanager get-secret-value --secret-id ${GatewayApiKeySecret}
+      --region ${AWS::Region} --query SecretString --output text
+
+  ReadinessFileOnInstance:
+    Description: Same summary on the instance; also written to /etc/motd
+    Value: /opt/eat-ready.txt
+
+  InstanceId:
+    Description: Control plane instance
+    Value: !Ref ToolkitInstance
+
+  PrivateIp:
+    Description: Private IP of the control plane instance
+    Value: !GetAtt ToolkitInstance.PrivateIp
+
+  SsmSessionCommand:
+    Description: Open a shell without SSH keys
+    Value: !Sub 'aws ssm start-session --target ${ToolkitInstance} --region ${AWS::Region}'
+
+  SshCommand:
+    Condition: HasKeyPair
+    Description: >-
+      SSH from inside the VPC (private IP). The login user is the AMI's uid-1000
+      account - ubuntu on this image.
+    Value: !Sub 'ssh -i ${KeyName}.pem ubuntu@${ToolkitInstance.PrivateIp}'
+
+  GatewayPortForwardCommand:
+    Description: Tunnel the LiteLLM gateway to localhost:4000
+    Value: !Sub >-
+      aws ssm start-session --target ${ToolkitInstance} --region ${AWS::Region}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["4000"],"localPortNumber":["4000"]}'
+
+  BootstrapLog:
+    Description: Where to look when the stack times out
+    Value: /var/log/eat-bootstrap.log
+
+  BootstrapLogS3Prefix:
+    Condition: ShipDiagnostics
+    Description: >-
+      Copy of the bootstrap log, written on success and on every failure. Survives the
+      instance, so it is still readable after a rollback or delete-stack.
+    Value: !Sub
+      - 's3://${DiagBucket}/eat-bootstrap-logs/${AWS::StackName}/'
+      - DiagBucket: !If [HasDiagnosticsBucket, !Ref DiagnosticsS3Bucket, !Ref CodeOverlayS3Bucket]
+
+  BedrockRegionUsed:
+    Description: Bedrock region wired into the gateway
+    Value: !If [BedrockInStackRegion, !Ref AWS::Region, !Ref BedrockRegion]
+
+  OpenSearchDomainNameUsed:
+    Condition: UseOpenSearch
+    Description: Memory backend domain name (passed to the toolkit as opensearch_domain_name)
+    Value: !If
+      - AutoDomainName
+      - !Sub '${AWS::StackName}-mem'
+      - !Ref OpenSearchDomainName
+
+  OpenSearchEndpoint:
+    Condition: UseOpenSearch
+    Description: VPC endpoint of the memory backend. Reachable only from inside the VPC.
+    Value: !Sub 'https://${MemoryDomain.DomainEndpoint}'
+
+  OpenSearchDashboardsUrl:
+    Condition: UseOpenSearch
+    Description: OpenSearch Dashboards. Tunnel with the port-forward command below.
+    Value: !Sub 'https://${MemoryDomain.DomainEndpoint}/_dashboards/'
+
+  OpenSearchMasterSecretArn:
+    Condition: UseOpenSearch
+    Description: >-
+      FGAC master credentials. Read with
+      'aws secretsmanager get-secret-value --secret-id <arn> --query SecretString'
+    Value: !Ref OpenSearchMasterSecret
+
+  MemorySecretCommand:
+    Condition: UseOpenSearch
+    Description: Read the in-cluster connection URL the toolkit published
+    Value: >-
+      kubectl get secret opensearch-credentials -n opensearch
+      -o jsonpath='{.data.OPENSEARCH_URL}' | base64 -d
+
+  OpenSearchPortForwardCommand:
+    Condition: UseOpenSearch
+    Description: Tunnel OpenSearch Dashboards to localhost:8443 via the control plane
+    Value: !Sub >-
+      aws ssm start-session --target ${ToolkitInstance} --region ${AWS::Region}
+      --document-name AWS-StartPortForwardingSessionToRemoteHost
+      --parameters '{"host":["${MemoryDomain.DomainEndpoint}"],"portNumber":["443"],"localPortNumber":["8443"]}'
+
+  MemoryDomainTeardown:
+    Condition: UseOpenSearch
+    Description: Teardown note
+    Value: >-
+      'delete-stack' deletes the OpenSearch domain and all agent memory with it, and
+      takes ~15-30 min to do so. The domain is NOT retained: retaining it would
+      deadlock deletion of its own security group and leave the stack in
+      ROLLBACK_FAILED. Snapshot first if the memory matters.
