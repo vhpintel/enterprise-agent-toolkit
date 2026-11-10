@@ -30,6 +30,13 @@ rack_scale_mode=off
 deploy_guardrails=on
 deploy_vllm_sr=off
 deploy_openshell=off
+deploy_opensearch=off
+opensearch_domain_name=
+opensearch_secret_arn=
+opensearch_region=
+opensearch_session_ttl_hours=24
+opensearch_embed_model=amazon.titan-embed-text-v2:0
+opensearch_seed_sample_data=on
 http_proxy=
 https_proxy=
 no_proxy=
@@ -60,6 +67,13 @@ Make sure to update the values in the agentic-config.cfg file according to your 
 > - `deploy_guardrails` (default: `on`) deploys the safety content-moderation guardrail in front of the main LLM — see [guardrails.md](./guardrails.md).
 > - If `deploy_vllm_sr` is set to `on`, vLLM Semantic Router is deployed to route requests across models by cost/latency/safety signals — see [vllm-semantic-router.md](./vllm-semantic-router.md).
 > - If `deploy_openshell` is set to `on`, NVIDIA OpenShell will be deployed for policy-enforced sandboxes on top of Agent Sandbox, with the GenAI Gateway registered as a provider. Requires `deploy_agent_sandbox=on` — see [docs/openshell.md](./openshell.md).
+> - If `deploy_opensearch` is set to `on`, an existing Amazon OpenSearch Service domain is used as the memory backend for **both** tiers — `agent-session-memory` for short-term session state and `agent-knowledge` for long-term knowledge with hybrid k-NN + BM25 retrieval. It replaces the in-cluster backends, so set `deploy_redis=off` and `deploy_pgvector=off` alongside it. The domain must already exist; the toolkit discovers it, creates the indices and the search pipeline, and publishes the connection details as the `opensearch-credentials` Secret — see [backend-connection-reference.md](./backend-connection-reference.md#amazon-opensearch-service-managed-memory-backend).
+>   - `opensearch_domain_name` — the domain name (not the endpoint). The controller polls `aws opensearch describe-domain` until the domain leaves `Processing`, so the domain may still be building when deployment starts.
+>   - `opensearch_secret_arn` — ARN of the AWS Secrets Manager secret holding the FGAC master `username`/`password`. The password is read at deploy time and is deliberately **not** stored in this file: values here are passed through `xargs`, which mangles quotes and shell metacharacters in generated passwords.
+>   - `opensearch_region` — AWS region of the domain. Defaults to the instance/CLI region when left empty.
+>   - `opensearch_session_ttl_hours` — how long short-term session documents live (default `24`). Enforced by the `opensearch-session-ttl` CronJob, since OpenSearch has no per-document expiry.
+>   - `opensearch_embed_model` — embedding model registered on the GenAI Gateway (default `amazon.titan-embed-text-v2:0`, 1024 dimensions). The `knn_vector` dimension is immutable once the index exists, so changing this requires recreating `agent-knowledge`.
+>   - `opensearch_seed_sample_data` — when `on`, embeds `core/inventory/sample-knowledge.jsonl` through the gateway and bulk-indexes it, so a RAG query returns results immediately after deployment. Skipped if the index already holds documents.
 
 ---
 

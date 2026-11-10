@@ -123,6 +123,8 @@ Maintains agent memory across the full lifecycle — short-term working context 
 
 **Default provider:** Redis + RediSearch (short-term) · PostgreSQL + pgvector (long-term)
 
+**Managed alternative (AWS):** Amazon OpenSearch Service serves both tiers from one domain — `agent-session-memory` for short-term context and `agent-knowledge` for long-term knowledge with hybrid k-NN + BM25 retrieval. Enable with `deploy_opensearch=on` (and `deploy_redis=off`, `deploy_pgvector=off`); see [backend-connection-reference.md](docs/backend-connection-reference.md#amazon-opensearch-service-managed-memory-backend).
+
 ---
 
 ### Observability & Telemetry

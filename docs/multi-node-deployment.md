@@ -17,6 +17,7 @@ The Kubernetes layer is provisioned by **Kubespray**, which natively supports mu
 - [Step 6 — Redis (Shared Memory Backend)](#step-6--redis-shared-memory-backend)
 - [Step 7 — PostgreSQL + pgvector (Vector Store)](#step-7--postgresql--pgvector-vector-store--long-term-memory)
 - [Step 8 — Agent Sandbox (Sandboxed Code Execution)](#step-8--agent-sandbox-sandboxed-code-execution)
+- [Step 9 — Amazon OpenSearch Service (Managed Memory Backend, Optional)](#step-9--amazon-opensearch-service-managed-memory-backend-optional)
 - [Adding a Worker Node to a Running Cluster](#adding-a-worker-node-to-a-running-cluster)
 - [Supported Deployment Topologies](#supported-deployment-topologies)
 - [Notes](#notes)
@@ -104,6 +105,7 @@ deploy_pgvector=on            # optional: PostgreSQL 16 + pgvector — shared ve
 deploy_kuberay=off            # optional: KubeRay operator — enables Ray distributed computing inside the cluster
 deploy_agent_sandbox=on       # optional: Agent Sandbox controller — isolated pod environments for safe code execution
 deploy_openshell=off          # optional: NVIDIA OpenShell policy-enforced sandboxes (requires deploy_agent_sandbox=on)
+deploy_opensearch=off          # optional: Amazon OpenSearch Service instead of Redis + pgvector (set both of those off)
 
 # Proxy settings (optional, depending on network)
 http_proxy=
@@ -353,6 +355,8 @@ Go inside the `default` project. Under **Tracing**, select the most recent `lite
 
 Redis is the **common memory backend** for all agentic workloads in this stack — deploy it before any use-case agent (MCP agents, etc.).
 
+> If you plan to use the managed **Amazon OpenSearch Service** backend instead (AWS deployments — see [Step 10](#step-10--amazon-opensearch-service-managed-memory-backend-optional)), skip this step.
+
 The `core/helm-charts/redis` chart deploys **Redis Stack** (includes RediSearch) into its own `redis` namespace as a single persistent instance shared across all agents.
 
 **Automated deployment (recommended):**
@@ -425,6 +429,8 @@ Redis holds agent session state and is a code-execution surface (Lua, plus JavaS
 ## Step 6 — PostgreSQL + pgvector (Vector Store & Long-Term Memory)
 
 PostgreSQL 16 with the **pgvector** extension gives every agentic workload a persistent, queryable vector store for long-term memory, RAG pipelines, semantic search, and structured state storage.
+
+> If you plan to use the managed **Amazon OpenSearch Service** backend instead (AWS deployments — see [Step 10](#step-10--amazon-opensearch-service-managed-memory-backend-optional)), skip this step.
 
 **When to enable:**
 - Your agent needs long-term memory that survives pod/session restarts
@@ -527,6 +533,78 @@ kubectl get sandboxtemplate -n agent-sandbox-system
 > `http://sandbox-router-svc.agent-sandbox.svc.cluster.local:8080`
 
 For the full guide — adding custom templates, WarmPools, and SDK usage — see **[agent-sandbox.md](agent-sandbox.md)**.
+
+---
+
+## Step 9 — Amazon OpenSearch Service (Managed Memory Backend, Optional)
+
+An alternative to Steps 7 and 8 for AWS deployments: one managed Amazon OpenSearch Service domain serves **both** memory tiers, so no Redis Stack and no PostgreSQL pod run in the cluster. On a multi-node cluster this also removes the only two stateful in-cluster workloads that need node-pinned persistent volumes. This step is optional and only applicable to AWS deployments — skip it otherwise.
+
+**Prerequisite:** the domain must already exist, with fine-grained access control enabled and its master `username`/`password` stored in an AWS Secrets Manager secret. The domain does *not* have to be finished building — the controller polls `describe-domain` and waits. Every node that could run the deploy needs `es:ESHttp*`, `es:DescribeDomain` and `secretsmanager:GetSecretValue`, and network reachability to the domain's VPC endpoint on 443.
+
+**Enable in `core/inventory/agentic-config.cfg`:**
+
+```ini
+deploy_redis=off          # replaced by agent-session-memory
+deploy_pgvector=off       # replaced by agent-knowledge
+deploy_opensearch=on
+opensearch_domain_name=my-stack-mem
+opensearch_secret_arn=arn:aws:secretsmanager:us-west-2:123456789012:secret:my-stack-mem-master-AbCdEf
+opensearch_region=us-west-2
+opensearch_session_ttl_hours=24
+opensearch_embed_model=amazon.titan-embed-text-v2:0
+opensearch_seed_sample_data=on
+```
+
+The master password is read from Secrets Manager at deploy time and is deliberately **not** put in this file — values here pass through `xargs`, which mangles quotes and shell metacharacters in generated passwords.
+
+```bash
+./deploy-agentic-stack.sh
+```
+
+**What gets created:**
+
+| Resource | Detail |
+|---|---|
+| Namespace | `opensearch` |
+| Credentials secret | `opensearch-credentials` (`OPENSEARCH_URL`, `OPENSEARCH_ENDPOINT`, username/password, index names) |
+| Short-term index | `agent-session-memory` — session state, `expires_at`-stamped |
+| Long-term index | `agent-knowledge` — `knn_vector` (1024 dims) + `text` for BM25 |
+| Search pipeline | `hybrid-rag-pipeline` — min-max normalisation, 0.7 vector / 0.3 lexical |
+| TTL reaper | CronJob `opensearch-session-ttl`, every 15 min |
+| Seeded corpus | `core/inventory/sample-knowledge.jsonl`, embedded through the GenAI Gateway |
+
+**Verify:**
+
+```bash
+OS=$(kubectl get secret opensearch-credentials -n opensearch \
+  -o jsonpath='{.data.OPENSEARCH_URL}' | base64 -d)
+
+curl -s "$OS/_cluster/health" | jq .status        # "yellow" on a single-node domain — expected
+curl -s "$OS/agent-knowledge/_count" | jq .count  # > 0 once the corpus is seeded
+kubectl get cronjob -n opensearch                 # opensearch-session-ttl
+
+# Short-term round-trip. Note the real-time GET — _search is ~1s behind.
+curl -s -XPUT "$OS/agent-session-memory/_doc/smoke-1" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"smoke","role":"user","content":"hello"}'
+curl -s "$OS/agent-session-memory/_doc/smoke-1" | jq .found   # true, immediately
+
+# RAG-style query/response round-trip against the seeded corpus (BM25 leg only,
+# no embedding call needed). For the full hybrid k-NN + BM25 query, see
+# backend-connection-reference.md#amazon-opensearch-service-managed-memory-backend.
+curl -s "$OS/agent-knowledge/_search" \
+  -H 'Content-Type: application/json' \
+  -d '{"size": 1, "_source": ["doc_id","title","text"],
+       "query": {"match": {"text": "session memory expiry"}}}' \
+  | jq '.hits.hits[]._source'
+```
+
+> Behind a forward proxy, the domain endpoint must be bypassed **by hostname** — a CIDR entry in `no_proxy` never matches `vpc-<domain>-<hash>.<region>.es.amazonaws.com`, because proxy libraries match on hostname before resolving DNS. `read_config_file()` appends `.es.amazonaws.com` automatically when `deploy_opensearch=on`.
+
+> The GenAI Gateway keeps its own bundled Redis (router state, response cache, rate limits) even with `deploy_redis=off`. That is not agent memory and must not be disabled — the gateway blocks on it at startup.
+
+For the connection contract, the read-after-write rule, the TTL mechanism and hybrid query examples, see **[backend-connection-reference.md](backend-connection-reference.md#amazon-opensearch-service-managed-memory-backend)**.
 
 ---
 
