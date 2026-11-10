@@ -29,7 +29,7 @@ fresh_installation() {
 
     echo "Deployment configuration: $deploy_kubernetes_fresh"
 
-    if [[  "$deploy_kubernetes_fresh" == "no" && "$deploy_ingress_controller" == "no" && "$deploy_llm_models" == "no" && "$deploy_observability" == "no" && "$deploy_genai_gateway" == "no" && "$deploy_istio" == "no" && "$deploy_ceph" == "no" && "$uninstall_ceph" == "no"  && "$deploy_nri_balloon_policy" == "no" && "$deploy_agenticai_plugin" == "no" && "$deploy_finetune_plugin" == "no" && "$deploy_redis" == "no" && "$deploy_pgvector" == "no" && "${deploy_agent_sandbox:-no}" == "no" && "${deploy_kata_containers:-no}" == "no" && "${deploy_vllm_sr:-no}" == "no" && "${deploy_openshell:-no}" == "no" ]]; then
+    if [[  "$deploy_kubernetes_fresh" == "no" && "$deploy_ingress_controller" == "no" && "$deploy_llm_models" == "no" && "$deploy_observability" == "no" && "$deploy_genai_gateway" == "no" && "$deploy_istio" == "no" && "$deploy_ceph" == "no" && "$uninstall_ceph" == "no"  && "$deploy_nri_balloon_policy" == "no" && "$deploy_agenticai_plugin" == "no" && "$deploy_finetune_plugin" == "no" && "$deploy_redis" == "no" && "$deploy_pgvector" == "no" && "${deploy_opensearch:-no}" == "no" && "${deploy_agent_sandbox:-no}" == "no" && "${deploy_kata_containers:-no}" == "no" && "${deploy_vllm_sr:-no}" == "no" && "${deploy_openshell:-no}" == "no" ]]; then
     # Check if all deployment steps are set to "no" after getting user input
         echo "No installation or deployment steps selected. Skipping setup_initial_env..."
         echo "--------------------------------------------------------------------"
@@ -389,6 +389,17 @@ fresh_installation() {
                     "Failed to deploy PostgreSQL + pgvector. Exiting!."
             else
                 echo "Skipping PostgreSQL + pgvector deployment..."
+            fi
+
+            # Managed memory backend. Ordered after the GenAI Gateway (deployed
+            # above) because seeding the knowledge index embeds through the
+            # gateway, i.e. through Amazon Bedrock.
+            if [[ "${deploy_opensearch:-no}" == "yes" ]]; then
+                execute_and_check "Binding memory backend to Amazon OpenSearch Service..." deploy_opensearch_controller \
+                    "Amazon OpenSearch Service memory backend bound successfully." \
+                    "Failed to bind Amazon OpenSearch Service memory backend. Exiting!."
+            else
+                echo "Skipping Amazon OpenSearch Service memory backend..."
             fi
 
             if [[ "${deploy_agent_sandbox:-no}" == "yes" ]]; then

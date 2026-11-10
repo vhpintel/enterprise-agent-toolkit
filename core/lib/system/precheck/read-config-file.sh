@@ -150,8 +150,17 @@ except Exception:
         local _k8s_base; _k8s_base="$(_build_k8s_no_proxy)"
         # Namespace-level wildcards cover short-form service DNS names
         # (e.g. vllm-service.default) in addition to fully-qualified ones.
-        local _ns_suffixes=".default,.genai-gateway,.redis,.ingress-nginx,.agent-sandbox,.openshell-system,.flowise,.vllm-sr"
+        local _ns_suffixes=".default,.genai-gateway,.redis,.ingress-nginx,.agent-sandbox,.openshell-system,.flowise,.vllm-sr,.opensearch,"
         local _k8s_no_proxy="${_k8s_base},${_ns_suffixes}localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.default,.genai-gateway,.redis,.ingress-nginx,.agent-sandbox,.flowise,169.254.0.0/16,${service_cidr},${pod_cidr}${_node_ip:+,${_node_ip}}${_fabric_no_proxy:+,${_fabric_no_proxy}}${cluster_url:+,${cluster_url}}"
+        # A VPC-attached Amazon OpenSearch Service domain resolves to private
+        # subnet addresses, but proxy libraries (curl, boto3, Go) match no_proxy
+        # against the request HOSTNAME before resolving DNS. A CIDR entry
+        # therefore never matches vpc-<domain>-<hash>.<region>.es.amazonaws.com,
+        # and the request is handed to the corporate proxy, which has no route to
+        # a private address and blackholes it. Bypass by hostname suffix instead.
+        if [[ "${deploy_opensearch:-no}" == "yes" ]]; then
+            _k8s_no_proxy="${_k8s_no_proxy},.es.amazonaws.com,.aos.amazonaws.com"
+        fi
         if [[ -n "${no_proxy:-}" ]]; then
             no_proxy="${no_proxy},${_k8s_no_proxy}"
         else

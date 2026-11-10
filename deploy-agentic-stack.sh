@@ -532,12 +532,24 @@ deploy_observability=on
 deploy_llm_models=on
 deploy_agenticai_plugin=off
 deploy_redis=on
+deploy_pgvector=off
 deploy_kuberay=off
 deploy_agent_sandbox=off
 deploy_kata_containers=off
 kata_runtime=kata-fc
 deploy_vllm_sr=off
 deploy_openshell=off
+# Managed memory backend (Amazon OpenSearch Service). Turning this on replaces
+# the in-cluster Redis Stack and pgvector backends, so set deploy_redis=off and
+# deploy_pgvector=off alongside it. The domain must already exist; the password
+# is read from Secrets Manager at deploy time and never stored here.
+deploy_opensearch=off
+opensearch_domain_name=
+opensearch_secret_arn=
+opensearch_region=
+opensearch_session_ttl_hours=24
+opensearch_embed_model=amazon.titan-embed-text-v2:0
+opensearch_seed_sample_data=on
 http_proxy=${_http_proxy}
 https_proxy=${_https_proxy}
 no_proxy=${_no_proxy}
@@ -679,6 +691,7 @@ _source_core_libs() {
     source "${CORE_DIR}/lib/components/redis-controller.sh"
     source "${CORE_DIR}/lib/components/kuberay-controller.sh"
     source "${CORE_DIR}/lib/components/pgvector-controller.sh"
+    source "${CORE_DIR}/lib/components/opensearch-controller.sh"
     source "${CORE_DIR}/lib/components/agent-sandbox-controller.sh"
     source "${CORE_DIR}/lib/components/kata-containers-controller.sh"
     source "${CORE_DIR}/lib/components/gpu-operator.sh"
