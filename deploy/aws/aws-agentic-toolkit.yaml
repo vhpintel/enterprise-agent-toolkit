@@ -20,7 +20,7 @@ Metadata:
       - Label: {default: Compute}
         Parameters: [InstanceType, AmiId, RootVolumeSizeGb, KeyName]
       - Label: {default: Bedrock}
-        Parameters: [BedrockRegion, BedrockChatModels, BedrockEmbedModel, CreateBedrockVpcEndpoint]
+        Parameters: [BedrockRegion, BedrockChatModels, BedrockEmbedModel, CreateBedrockVpcEndpoint, BedrockModelAvailabilityCheck]
       - Label: {default: Agentic components}
         Parameters:
           - MemoryBackend
@@ -188,6 +188,18 @@ Parameters:
       a US BedrockRegion; elsewhere use that geography's profiles (eu., apac.) or
       in-region model IDs. Cross-region models MUST carry a profile prefix, otherwise
       Bedrock returns ValidationException on invoke.
+
+  BedrockModelAvailabilityCheck:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Check, in the first minute and before anything billed is created, that every model
+      in BedrockChatModels and BedrockEmbedModel is usable in this account (the Bedrock
+      GetFoundationModelAvailability API). Models from Anthropic and several other
+      providers need a one-time Marketplace subscription that this template cannot make
+      for you; without this check a missing one only surfaces after about 40 minutes.
+      Set false to skip the check.
 
   BedrockEmbedModel:
     Type: String
@@ -630,9 +642,199 @@ Resources:
         - {Key: Name, Value: !Sub '${AWS::StackName}-mem-sg'}
         - {Key: Project, Value: enterprise-agent-toolkit}
 
+  # Fails the stack in the first minute, before the instance or the OpenSearch domain
+  # exist, when a chosen Bedrock model is not usable in this account. Anthropic and
+  # several other providers need a one-time Marketplace subscription, and the instance
+  # role is deliberately not allowed to make it (aws-marketplace:Subscribe has no
+  # resource-level scoping). Everything billed DependsOn this resource.
+  BedrockCheckFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ReadBedrockModelAvailability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:GetFoundationModelAvailability
+                Resource: '*'
+      Tags:
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  BedrockCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Verifies the chosen Bedrock models are usable in this account
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt BedrockCheckFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          import cfnresponse
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.session import get_session
+
+          # Calls the REST endpoint directly, signed with botocore, so this works however
+          # old the SDK bundled in the Lambda runtime is (the API is newer than some).
+          PROFILE_PREFIXES = {"us", "eu", "apac", "global", "us-gov", "jp", "au", "ca"}
+
+          def base_id(model_id):
+              head, _, rest = model_id.partition(".")
+              return rest if head in PROFILE_PREFIXES and rest else model_id
+
+          def availability(region, model_id):
+              url = "https://bedrock.%s.amazonaws.com/foundation-model-availability/%s" % (
+                  region, urllib.parse.quote(base_id(model_id), safe=""))
+              creds = get_session().get_credentials().get_frozen_credentials()
+              last = None
+              for attempt in range(4):
+                  req = AWSRequest(method="GET", url=url)
+                  SigV4Auth(creds, "bedrock", region).add_auth(req)
+                  try:
+                      http = urllib.request.Request(url, headers=dict(req.headers))
+                      with urllib.request.urlopen(http, timeout=15) as resp:
+                          return json.loads(resp.read())
+                  except urllib.error.HTTPError as e:
+                      last = "HTTP %s %s" % (e.code, e.read()[:160].decode("utf-8", "replace"))
+                      if e.code not in (429, 500, 502, 503, 504):
+                          break
+                  except Exception as e:
+                      last = str(e)[:160]
+                  time.sleep(2 * (attempt + 1))
+              raise RuntimeError(last)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  if event["RequestType"] == "Delete" or props.get("Enabled") != "true":
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  region = props["Region"]
+                  models = [m.strip() for m in props["Models"] if m.strip()]
+                  models.append(props["EmbedModel"].strip())
+                  bad = []
+                  for m in models:
+                      try:
+                          r = availability(region, m)
+                      except Exception as e:
+                          bad.append("%s (%s)" % (m, e))
+                          continue
+                      agreement = (r.get("agreementAvailability") or {}).get("status")
+                      if (r.get("authorizationStatus") != "AUTHORIZED" or agreement != "AVAILABLE"
+                              or r.get("regionAvailability") != "AVAILABLE"):
+                          bad.append("%s (authorization %s, agreement %s, region %s)" % (
+                              m, r.get("authorizationStatus"), agreement, r.get("regionAvailability")))
+                  if bad:
+                      msg = ("Bedrock model(s) not usable in this account in %s: %s. "
+                             "Open the Bedrock console > Model catalog, enable each model (a "
+                             "one-time Marketplace subscription), wait a few minutes, then "
+                             "redeploy. Set BedrockModelAvailabilityCheck=false to skip this "
+                             "check." % (region, "; ".join(bad)))
+                      print(msg)
+                      return cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=msg[:900])
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e)[:400])
+
+  BedrockModelCheck:
+    Type: Custom::BedrockModelCheck
+    Properties:
+      ServiceToken: !GetAtt BedrockCheckFunction.Arn
+      Enabled: !Ref BedrockModelAvailabilityCheck
+      Region: !If [BedrockInStackRegion, !Ref AWS::Region, !Ref BedrockRegion]
+      Models: !Ref BedrockChatModels
+      EmbedModel: !Ref BedrockEmbedModel
+
+  # A VPC-attached OpenSearch domain needs the account's OpenSearch service-linked
+  # role. An account that has never used OpenSearch does not have it, and domain
+  # creation then fails with "you must enable a service-linked role". A plain
+  # AWS::IAM::ServiceLinkedRole resource would fail the other way, in every account
+  # that already has the role, so this creates it only when it is missing. It is never
+  # deleted: the role is shared by every OpenSearch domain in the account.
+  OpenSearchSlrFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: UseOpenSearch
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CreateOpenSearchServiceLinkedRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/opensearchservice.amazonaws.com/AWSServiceRoleForAmazonOpenSearchService'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: opensearchservice.amazonaws.com
+      Tags:
+        - {Key: Project, Value: enterprise-agent-toolkit}
+
+  OpenSearchSlrFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseOpenSearch
+    Properties:
+      Description: Creates the OpenSearch service-linked role if the account lacks it
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 90
+      Role: !GetAtt OpenSearchSlrFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Create":
+                      try:
+                          boto3.client("iam").create_service_linked_role(
+                              AWSServiceName="opensearchservice.amazonaws.com")
+                          time.sleep(15)  # let the new role propagate before the domain uses it
+                      except ClientError as e:
+                          # Already present (the common case in an account that uses OpenSearch).
+                          if e.response["Error"]["Code"] != "InvalidInput" or "taken" not in str(e):
+                              raise
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e)[:400])
+
+  OpenSearchServiceLinkedRole:
+    Type: Custom::OpenSearchServiceLinkedRole
+    Condition: UseOpenSearch
+    Properties:
+      ServiceToken: !GetAtt OpenSearchSlrFunction.Arn
+
   MemoryDomain:
     Type: AWS::OpenSearchService::Domain
     Condition: UseOpenSearch
+    DependsOn: [OpenSearchServiceLinkedRole, BedrockModelCheck]
     Properties:
       DomainName: !If
         - AutoDomainName
@@ -881,6 +1083,7 @@ Resources:
 
   ToolkitInstance:
     Type: AWS::EC2::Instance
+    DependsOn: BedrockModelCheck
     Metadata:
       # ---- stage 2 of the bootstrap ----------------------------------------------
       # Held here, not in UserData, because EC2 caps user data at 16 KB pre-base64.
@@ -1670,7 +1873,9 @@ Resources:
             echo "preflight: verifying Bedrock model access in ${BedrockRgn}"
             bedrock_preflight_fail() {
               local mid="$1" out="$2"
-              if echo "$out" | grep -qiE "AccessDenied|not authorized|don.t have access"; then
+              if echo "$out" | grep -qi "Marketplace"; then
+                fail "Bedrock model '$mid' needs a one-time AWS Marketplace subscription in this account. Enable it in the Bedrock console (Model catalog), wait a few minutes, then re-launch. The instance role cannot subscribe: $(echo "$out" | tr '\n' ' ' | cut -c1-200)"
+              elif echo "$out" | grep -qiE "AccessDenied|not authorized|don.t have access"; then
                 fail "Bedrock model '$mid' is not enabled for this account in ${BedrockRgn}. Enable it: AWS Console -> Bedrock -> Model access -> ${BedrockRgn}, then re-launch the stack."
               else
                 fail "Bedrock preflight failed for '$mid': $(echo "$out" | tr '\n' ' ' | cut -c1-300)"

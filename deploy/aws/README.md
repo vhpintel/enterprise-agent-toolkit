@@ -40,8 +40,15 @@ it deploys into an existing VPC and subnet.
 - **Proxy-only networks.** If the subnet's only route out is a corporate proxy (for
   example a Transit Gateway with no NAT or Internet gateway), set `HttpProxy`;
   without it the first `apt` call times out and the stack fails after a few minutes.
-- **Bedrock model access** enabled for the account in the Bedrock region. The
-  bootstrap's preflight check fails within minutes if it isn't.
+- **Bedrock models usable in the account.** Models from Anthropic and several other
+  providers need a one-time AWS Marketplace subscription that the stack cannot make for
+  you: in the Bedrock console open *Model catalog* in your Bedrock region and enable each
+  model in `BedrockChatModels`, then wait a few minutes. The stack checks this in its first
+  minute (`BedrockModelAvailabilityCheck`) and fails with the model names if one is not
+  ready; the Amazon models (Nova, Titan) need no subscription. To see what an account can
+  use now:
+  `aws bedrock get-foundation-model-availability --region <region> --model-id <id>`
+  and look for `agreementAvailability: AVAILABLE`.
 - **The chosen c8i/m8i/r8i size offered** in the region and AZ, plus enough On-Demand
   Standard vCPU quota.
 

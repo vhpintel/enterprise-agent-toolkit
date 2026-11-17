@@ -1,8 +1,10 @@
 # IAM least-privilege review
 
-The stack creates exactly one IAM role, `InstanceRole`. It's assumable only by
+The stack creates three IAM roles. `InstanceRole` is assumable only by
 `ec2.amazonaws.com` and attached to the control plane instance through an instance
-profile. No IAM users or access keys are created, and none are requested from you.
+profile. `OpenSearchSlrFunctionRole` and `BedrockCheckFunctionRole` belong to one-shot
+Lambdas and are described under [OpenSearchSlrFunctionRole](#opensearchslrfunctionrole) and
+[BedrockCheckFunctionRole](#bedrockcheckfunctionrole). No IAM users or access keys are created, and none are requested from you.
 Everything else in the stack that touches access control is a resource policy. Both
 are listed below.
 
@@ -59,6 +61,41 @@ SSM-managed instances.
 | Action | Resource | Why |
 |---|---|---|
 | `sns:Publish` | This stack's `ReadyTopic` only | The readiness email |
+
+## OpenSearchSlrFunctionRole
+
+Only created when `MemoryBackend=opensearch`. A VPC-attached OpenSearch domain needs the
+account's OpenSearch service-linked role, which an account that has never used OpenSearch
+does not have. A small Lambda creates it if it is missing and does nothing if it already
+exists. The role is shared by every OpenSearch domain in the account, so it is never
+deleted with the stack.
+
+| Permission | Resource | Why |
+|---|---|---|
+| `iam:CreateServiceLinkedRole` | `AWSServiceRoleForAmazonOpenSearchService` only, with the condition `iam:AWSServiceName = opensearchservice.amazonaws.com` | Creates that one service-linked role and nothing else |
+| `AWSLambdaBasicExecutionRole` (AWS managed) | CloudWatch Logs | The function's own logs |
+
+The principal that deploys the stack also needs `iam:CreateServiceLinkedRole` and
+`lambda:CreateFunction` for this to be created.
+
+## BedrockCheckFunctionRole
+
+Belongs to a one-shot Lambda that runs at the start of the stack, before the instance or
+the OpenSearch domain are created. For every model in `BedrockChatModels` and
+`BedrockEmbedModel` it asks Bedrock whether the model is usable in this account, and fails
+the stack straight away with a clear message if one is not. Without it, a model that has not
+been subscribed through AWS Marketplace only surfaces about 40 minutes into the deploy.
+Set `BedrockModelAvailabilityCheck=false` to skip it.
+
+| Permission | Resource | Why |
+|---|---|---|
+| `bedrock:GetFoundationModelAvailability` | `*` | Read-only status of a model in this account. The action does not support resource-level permissions |
+| `AWSLambdaBasicExecutionRole` (AWS managed) | CloudWatch Logs | The function's own logs |
+
+The instance role is deliberately **not** given `aws-marketplace:Subscribe`: it has no
+resource-level scoping, so a compromised instance could subscribe the account to arbitrary
+Marketplace products. Subscribing to a model is a one-time step for the account owner in the
+Bedrock console.
 
 ## Resource policy: OpenSearch domain
 
